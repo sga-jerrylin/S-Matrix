@@ -1,0 +1,110 @@
+# Apache Doris 4.0 Docker Compose 配置
+# 简化版本：1 FE + 1 BE 用于开发测试
+version: '3.8'
+
+services:
+  # Frontend (FE) - 元数据管理和查询协调
+  doris-fe:
+    image: apache/doris:fe-4.0.0
+    container_name: doris-fe
+    hostname: doris-fe
+    environment:
+      - FE_SERVERS=fe1:172.20.80.2:9010
+      - FE_ID=1
+    ports:
+      - "18030:8030"   # HTTP 端口 - Web UI
+      - "19030:9030"   # MySQL 协议端口 - 客户端连接
+      - "19010:9010"   # FE 内部通信端口
+    volumes:
+      - doris-fe-meta:/opt/apache-doris/fe/doris-meta
+      - doris-fe-log:/opt/apache-doris/fe/log
+    networks:
+      doris-network:
+        ipv4_address: 172.20.80.2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8030/api/bootstrap"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # Backend (BE) - 数据存储和查询执行
+  doris-be:
+    image: apache/doris:be-4.0.0
+    container_name: doris-be
+    hostname: doris-be
+    depends_on:
+      doris-fe:
+        condition: service_healthy
+    environment:
+      - FE_SERVERS=fe1:172.20.80.2:9010
+      - BE_ADDR=172.20.80.3:9050
+    ports:
+      - "18040:8040"   # BE HTTP 端口
+      - "19050:9050"   # BE 心跳端口
+      - "19060:9060"   # BE Thrift 端口
+    volumes:
+      - doris-be-storage:/opt/apache-doris/be/storage
+      - doris-be-log:/opt/apache-doris/be/log
+    networks:
+      doris-network:
+        ipv4_address: 172.20.80.3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8040/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # API Gateway
+  doris-api:
+    build: ./doris-api
+    container_name: doris-api
+    ports:
+      - "8018:8000"
+    networks:
+      - doris-network
+    depends_on:
+      doris-fe:
+        condition: service_healthy
+      doris-be:
+        condition: service_healthy
+    environment:
+      - DORIS_HOST=doris-fe
+      - DORIS_PORT=9030
+      - DORIS_STREAM_LOAD_HOST=doris-be
+      - DORIS_STREAM_LOAD_PORT=8040
+      - DEEPSEEK_API_KEY=sk-748638f482f74b7392a6dafd89bdd307
+      - DEEPSEEK_MODEL=deepseek-chat
+      - DEEPSEEK_BASE_URL=https://api.deepseek.com
+
+  # Frontend Web UI
+  doris-frontend:
+    build:
+      context: ./doris-frontend
+      dockerfile: Dockerfile
+    container_name: doris-frontend
+    ports:
+      - "5173:80"
+    networks:
+      - doris-network
+    depends_on:
+      - doris-api
+
+networks:
+  doris-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.80.0/24
+
+volumes:
+  doris-fe-meta:
+    driver: local
+  doris-fe-log:
+    driver: local
+  doris-be-storage:
+    driver: local
+  doris-be-log:
+    driver: local
+
