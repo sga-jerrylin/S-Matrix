@@ -36,7 +36,7 @@ services:
       doris-fe:
         condition: service_healthy
     environment:
-      - FE_SERVERS=fe1:172.20.80.2:9010
+      - FE_SERVERS=fe1:192.168.88.2:9010
       - BE_ADDR=192.168.88.3:9050
     ports:
       - "18040:8040"   # BE HTTP 端口
