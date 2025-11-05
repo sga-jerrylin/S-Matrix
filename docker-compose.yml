@@ -1,6 +1,5 @@
 # Apache Doris 4.0 Docker Compose 配置
 # 简化版本：1 FE + 1 BE 用于开发测试
-version: '3.8'
 
 services:
   # Frontend (FE) - 元数据管理和查询协调
@@ -9,7 +8,7 @@ services:
     container_name: doris-fe
     hostname: doris-fe
     environment:
-      - FE_SERVERS=fe1:172.20.80.2:9010
+      - FE_SERVERS=fe1:172.25.0.2:9010
       - FE_ID=1
     ports:
       - "18030:8030"   # HTTP 端口 - Web UI
@@ -20,7 +19,7 @@ services:
       - doris-fe-log:/opt/apache-doris/fe/log
     networks:
       doris-network:
-        ipv4_address: 172.20.80.2
+        ipv4_address: 172.25.0.2
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8030/api/bootstrap"]
       interval: 30s
@@ -38,7 +37,7 @@ services:
         condition: service_healthy
     environment:
       - FE_SERVERS=fe1:172.20.80.2:9010
-      - BE_ADDR=172.20.80.3:9050
+      - BE_ADDR=172.25.0.3:9050
     ports:
       - "18040:8040"   # BE HTTP 端口
       - "19050:9050"   # BE 心跳端口
@@ -48,7 +47,7 @@ services:
       - doris-be-log:/opt/apache-doris/be/log
     networks:
       doris-network:
-        ipv4_address: 172.20.80.3
+        ipv4_address: 172.25.0.3
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8040/api/health"]
       interval: 30s
@@ -96,7 +95,8 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.80.0/24
+        - subnet: 172.25.0.0/24
+          gateway: 172.25.0.1
 
 volumes:
   doris-fe-meta:
