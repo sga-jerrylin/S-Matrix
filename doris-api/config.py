@@ -8,9 +8,9 @@ import os
 DORIS_CONFIG = {
     'host': os.getenv('DORIS_HOST', 'localhost'),
     'port': int(os.getenv('DORIS_PORT', '19030')),  # MySQL 协议端口
-    'user': 'root',
-    'password': '',
-    'database': 'test_db',
+    'user': os.getenv('DORIS_USER', 'root'),
+    'password': os.getenv('DORIS_PASSWORD', ''),
+    'database': os.getenv('DORIS_DATABASE', 'doris_db'),
     'charset': 'utf8mb4'
 }
 
