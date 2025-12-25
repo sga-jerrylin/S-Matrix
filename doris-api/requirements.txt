@@ -12,3 +12,6 @@ requests==2.32.3
 vanna==0.7.9
 openai==1.54.5
 
+# Scheduler for periodic sync
+apscheduler==3.10.4
+

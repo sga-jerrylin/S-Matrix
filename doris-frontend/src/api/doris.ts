@@ -37,6 +37,35 @@ export interface NaturalQueryRequest {
   base_url?: string;
 }
 
+export interface DataSourceTestRequest {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database?: string;
+}
+
+export interface DataSourceSaveRequest {
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+}
+
+export interface SyncTableRequest {
+  source_table: string;
+  target_table?: string;
+}
+
+export interface ScheduleSyncRequest {
+  datasource_id: string;
+  source_table: string;
+  target_table?: string;
+  schedule_type: 'hourly' | 'daily' | 'weekly';
+}
+
 export const dorisApi = {
   // 健康检查
   health: () => api.get('/api/health'),
@@ -84,5 +113,46 @@ export const dorisApi = {
 
   // 自然语言查询 (Text-to-SQL)
   naturalQuery: (data: NaturalQueryRequest) => api.post('/api/query/natural', data),
+
+  // 数据源管理
+  datasource: {
+    // 测试连接
+    test: (data: DataSourceTestRequest) => api.post('/api/datasource/test', data),
+    // 保存数据源
+    save: (data: DataSourceSaveRequest) => api.post('/api/datasource', data),
+    // 获取所有数据源
+    list: () => api.get('/api/datasource'),
+    // 删除数据源
+    delete: (dsId: string) => api.delete(`/api/datasource/${dsId}`),
+    // 获取数据源表列表
+    getTables: (dsId: string) => api.get(`/api/datasource/${dsId}/tables`),
+    // 同步单个表
+    syncTable: (dsId: string, data: SyncTableRequest) =>
+      api.post(`/api/datasource/${dsId}/sync`, data),
+    // 批量同步
+    syncMultiple: (dsId: string, tables: SyncTableRequest[]) =>
+      api.post(`/api/datasource/${dsId}/sync-multiple`, { tables }),
+  },
+
+  // 同步任务管理
+  syncTasks: {
+    // 创建定时同步任务
+    create: (data: ScheduleSyncRequest) => api.post('/api/sync/schedule', data),
+    // 获取所有任务
+    list: () => api.get('/api/sync/tasks'),
+    // 删除任务
+    delete: (taskId: string) => api.delete(`/api/sync/tasks/${taskId}`),
+  },
+
+  // 元数据分析
+  metadata: {
+    // 分析表格
+    analyze: (tableName: string, sourceType: string = 'manual') =>
+      api.post(`/api/tables/${tableName}/analyze?source_type=${sourceType}`),
+    // 获取表格元数据
+    get: (tableName: string) => api.get(`/api/tables/${tableName}/metadata`),
+    // 获取所有元数据
+    list: () => api.get('/api/metadata'),
+  },
 };
 
