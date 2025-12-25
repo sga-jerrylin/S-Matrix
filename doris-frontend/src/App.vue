@@ -19,6 +19,10 @@
             mode="inline"
             style="height: 100%; border-right: 0"
           >
+            <a-menu-item key="datasource">
+              <cloud-sync-outlined />
+              <span>数据源同步</span>
+            </a-menu-item>
             <a-menu-item key="upload">
               <upload-outlined />
               <span>Excel 上传</span>
@@ -39,6 +43,7 @@
         </a-layout-sider>
 
         <a-layout-content style="background: #f0f2f5; padding: 24px; min-height: 280px">
+          <DataSourceSync v-if="selectedKeys[0] === 'datasource'" />
           <ExcelUpload v-if="selectedKeys[0] === 'upload'" />
           <LLMConfig v-if="selectedKeys[0] === 'llm'" />
           <NaturalQuery v-if="selectedKeys[0] === 'natural'" />
@@ -51,14 +56,15 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { UploadOutlined, ApiOutlined, SearchOutlined, RobotOutlined } from '@ant-design/icons-vue';
+import { UploadOutlined, ApiOutlined, SearchOutlined, RobotOutlined, CloudSyncOutlined } from '@ant-design/icons-vue';
 import ExcelUpload from './components/ExcelUpload.vue';
 import LLMConfig from './components/LLMConfig.vue';
 import NaturalQuery from './components/NaturalQuery.vue';
 import DataQuery from './components/DataQuery.vue';
+import DataSourceSync from './components/DataSourceSync.vue';
 import { dorisApi } from './api/doris';
 
-const selectedKeys = ref(['upload']);
+const selectedKeys = ref(['datasource']);
 const healthStatus = ref<'success' | 'error' | 'default'>('default');
 const healthText = ref('检查中...');
 

@@ -1,0 +1,36 @@
+services:
+  doris-api:
+    build: .
+    container_name: doris-api
+    ports:
+      - "8000:8000"
+    environment:
+      # Doris 连接配置 - 使用 Doris 容器名
+      - DORIS_HOST=doris-fe
+      - DORIS_PORT=9030
+      - DORIS_USER=root
+      - DORIS_PASSWORD=
+      - DORIS_DATABASE=demo
+      - DORIS_HTTP_PORT=8040
+      # Doris Stream Load 配置 - 使用 BE 容器名
+      - DORIS_STREAM_LOAD_HOST=doris-be
+      - DORIS_STREAM_LOAD_PORT=8040
+      # DeepSeek API 配置
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=https://api.deepseek.com
+      - DEEPSEEK_MODEL=deepseek-chat
+      # API 配置
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      # 加密密钥（用于加密数据库密码）
+      - ENCRYPTION_KEY=dITsw-d5mJGd4qrPln29AldqAy8GCb4lMvvZvQGRBQU=
+    networks:
+      - doris_doris-network
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+networks:
+  doris_doris-network:
+    external: true
+

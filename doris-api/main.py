@@ -14,6 +14,8 @@ from handlers import action_handler
 from db import doris_client
 from upload_handler import excel_handler
 from vanna_doris import VannaDorisOpenAI
+from datasource_handler import datasource_handler, sync_scheduler
+from metadata_analyzer import metadata_analyzer
 
 app = FastAPI(
     title="Doris API Gateway",
@@ -63,12 +65,27 @@ async def startup_event():
             )
 
             cursor = conn.cursor()
+            
+            # 1. 检查并注册 BE (针对新环境初始化)
+            cursor.execute("SHOW BACKENDS")
+            backends = cursor.fetchall()
+            if not backends:
+                be_host = os.getenv('DORIS_STREAM_LOAD_HOST', 'doris-be')
+                be_heartbeat_port = 9050 # 默认心跳端口
+                print(f"⚙️  未发现已注册的 BE, 尝试自动注册: {be_host}:{be_heartbeat_port}")
+                try:
+                    cursor.execute(f'ALTER SYSTEM ADD BACKEND "{be_host}:{be_heartbeat_port}"')
+                    print(f"✅ 已发送注册 BE 指令: {be_host}:{be_heartbeat_port}")
+                    # 注册后给一点时间让 BE 就绪
+                    time.sleep(5)
+                except Exception as be_err:
+                    print(f"⚠️  注册 BE 失败 (可能已存在或正在初始化): {be_err}")
 
-            # 创建数据库
+            # 2. 创建数据库
             db_name = DORIS_CONFIG['database']
             print(f"📦 创建数据库: {db_name}")
             cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`")
-
+            
             # 验证数据库创建成功
             cursor.execute("SHOW DATABASES")
             databases = [row[0] for row in cursor.fetchall()]
@@ -80,6 +97,10 @@ async def startup_event():
 
             cursor.close()
             conn.close()
+
+            # 初始化系统表
+            datasource_handler.init_tables()
+            print("✅ 系统表已初始化")
 
             print("=" * 60)
             print("✅ Doris API Gateway 启动成功!")
@@ -100,6 +121,9 @@ async def startup_event():
                 print(f"错误: {str(e)}")
                 print("=" * 60)
                 raise
+
+    # 启动同步调度器
+    sync_scheduler.start()
 
 
 # ============ 数据模型 ============
@@ -512,6 +536,20 @@ async def preview_excel_file(file: UploadFile = File(...), rows: int = 10):
         )
 
 
+async def _analyze_table_async(table_name: str, source_type: str):
+    """异步分析表格元数据"""
+    import asyncio
+    await asyncio.sleep(2)  # 等待数据完全写入
+    try:
+        result = metadata_analyzer.analyze_table(table_name, source_type)
+        if result.get('success'):
+            print(f"✅ 表格 '{table_name}' 元数据分析完成")
+        else:
+            print(f"⚠️ 表格 '{table_name}' 元数据分析失败: {result.get('error')}")
+    except Exception as e:
+        print(f"❌ 元数据分析异常: {e}")
+
+
 @app.post("/api/upload")
 async def upload_excel(
     file: UploadFile = File(...),
@@ -548,6 +586,13 @@ async def upload_excel(
             create_table_if_not_exists=create_table_bool
         )
 
+        # 自动触发元数据分析（异步，不阻塞返回）
+        try:
+            import asyncio
+            asyncio.create_task(_analyze_table_async(table_name, 'excel'))
+        except Exception as analyze_error:
+            print(f"⚠️ 元数据分析触发失败: {analyze_error}")
+
         return result
 
     except Exception as e:
@@ -558,6 +603,270 @@ async def upload_excel(
                 "traceback": traceback.format_exc()
             }
         )
+
+
+# ============ 数据源同步 API ============
+
+class DataSourceTestRequest(BaseModel):
+    """数据源连接测试请求"""
+    host: str = Field(..., description="数据库主机")
+    port: int = Field(..., description="数据库端口")
+    user: str = Field(..., description="用户名")
+    password: str = Field(..., description="密码")
+    database: Optional[str] = Field(None, description="数据库名")
+
+
+class DataSourceSaveRequest(BaseModel):
+    """保存数据源请求"""
+    name: str = Field(..., description="数据源名称")
+    host: str = Field(..., description="数据库主机")
+    port: int = Field(..., description="数据库端口")
+    user: str = Field(..., description="用户名")
+    password: str = Field(..., description="密码")
+    database: str = Field(..., description="数据库名")
+
+
+class SyncTableRequest(BaseModel):
+    """同步表请求"""
+    source_table: str = Field(..., description="源表名")
+    target_table: Optional[str] = Field(None, description="目标表名")
+
+
+class SyncMultipleRequest(BaseModel):
+    """批量同步请求"""
+    tables: List[Dict[str, str]] = Field(..., description="要同步的表列表")
+
+
+@app.post("/api/datasource/test")
+async def test_datasource_connection(req: DataSourceTestRequest):
+    """测试数据源连接"""
+    result = datasource_handler.test_connection(
+        host=req.host,
+        port=req.port,
+        user=req.user,
+        password=req.password,
+        database=req.database
+    )
+    return result
+
+
+@app.post("/api/datasource")
+async def save_datasource(req: DataSourceSaveRequest):
+    """保存数据源配置"""
+    try:
+        result = datasource_handler.save_datasource(
+            name=req.name,
+            host=req.host,
+            port=req.port,
+            user=req.user,
+            password=req.password,
+            database=req.database
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/datasource")
+async def list_datasources():
+    """获取所有数据源"""
+    try:
+        datasources = datasource_handler.list_datasources()
+        return {
+            "success": True,
+            "datasources": datasources,
+            "count": len(datasources)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/datasource/{ds_id}")
+async def delete_datasource(ds_id: str):
+    """删除数据源"""
+    try:
+        result = datasource_handler.delete_datasource(ds_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/datasource/{ds_id}/tables")
+async def get_datasource_tables(ds_id: str):
+    """获取数据源中的表列表"""
+    try:
+        print(f"📋 获取数据源表列表: ds_id={ds_id}")
+        ds = datasource_handler.get_datasource(ds_id)
+        print(f"📋 数据源信息: {ds}")
+        if not ds:
+            raise HTTPException(status_code=404, detail="数据源不存在")
+
+        result = datasource_handler.get_remote_tables(
+            host=ds['host'],
+            port=ds['port'],
+            user=ds['user'],
+            password=ds['password'],
+            database=ds['database_name']
+        )
+        print(f"📋 获取表列表结果: {result}")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"❌ 获取表列表异常: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/datasource/{ds_id}/sync")
+async def sync_datasource_table(ds_id: str, req: SyncTableRequest):
+    """同步单个表"""
+    try:
+        result = datasource_handler.sync_table(
+            ds_id=ds_id,
+            source_table=req.source_table,
+            target_table=req.target_table
+        )
+        if not result.get('success'):
+            raise HTTPException(status_code=500, detail=result.get('error'))
+
+        # 自动触发元数据分析
+        target = req.target_table or req.source_table
+        try:
+            import asyncio
+            asyncio.create_task(_analyze_table_async(target, 'database_sync'))
+        except Exception as analyze_error:
+            print(f"⚠️ 元数据分析触发失败: {analyze_error}")
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/datasource/{ds_id}/sync-multiple")
+async def sync_multiple_tables(ds_id: str, req: SyncMultipleRequest):
+    """批量同步多个表"""
+    try:
+        result = datasource_handler.sync_multiple_tables(
+            ds_id=ds_id,
+            tables=req.tables
+        )
+
+        # 为每个成功同步的表触发元数据分析
+        if result.get('results'):
+            import asyncio
+            for table_result in result['results']:
+                if table_result.get('success'):
+                    target = table_result.get('target_table')
+                    try:
+                        asyncio.create_task(_analyze_table_async(target, 'database_sync'))
+                    except Exception as e:
+                        print(f"⚠️ 元数据分析触发失败: {e}")
+
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ 同步任务调度 API ============
+
+class ScheduleSyncRequest(BaseModel):
+    """定时同步请求"""
+    datasource_id: str = Field(..., description="数据源ID")
+    source_table: str = Field(..., description="源表名")
+    target_table: Optional[str] = Field(None, description="目标表名")
+    schedule_type: str = Field(..., description="调度类型: hourly/daily/weekly")
+
+
+@app.post("/api/sync/schedule")
+async def create_sync_schedule(req: ScheduleSyncRequest):
+    """创建定时同步任务"""
+    try:
+        result = datasource_handler.save_sync_task(
+            ds_id=req.datasource_id,
+            source_table=req.source_table,
+            target_table=req.target_table,
+            schedule_type=req.schedule_type
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sync/tasks")
+async def list_sync_tasks():
+    """获取所有同步任务"""
+    try:
+        tasks = datasource_handler.list_sync_tasks()
+        return {
+            "success": True,
+            "tasks": tasks,
+            "count": len(tasks)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/sync/tasks/{task_id}")
+async def delete_sync_task(task_id: str):
+    """删除同步任务"""
+    try:
+        result = datasource_handler.delete_sync_task(task_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ 元数据分析 API ============
+
+@app.post("/api/tables/{table_name}/analyze")
+async def analyze_table_metadata(table_name: str, source_type: str = "manual"):
+    """分析表格元数据"""
+    try:
+        result = metadata_analyzer.analyze_table(table_name, source_type)
+        if not result.get('success'):
+            raise HTTPException(status_code=500, detail=result.get('error'))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tables/{table_name}/metadata")
+async def get_table_metadata(table_name: str):
+    """获取表格元数据"""
+    try:
+        metadata = metadata_analyzer.get_metadata(table_name)
+        if not metadata:
+            return {
+                "success": True,
+                "metadata": None,
+                "message": "表格尚未分析，请先调用分析接口"
+            }
+        return {
+            "success": True,
+            "metadata": metadata
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/metadata")
+async def list_all_metadata():
+    """获取所有表格元数据"""
+    try:
+        metadata_list = metadata_analyzer.list_all_metadata()
+        return {
+            "success": True,
+            "metadata": metadata_list,
+            "count": len(metadata_list)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
