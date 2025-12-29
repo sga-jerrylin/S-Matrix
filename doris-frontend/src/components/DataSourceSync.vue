@@ -67,7 +67,7 @@
 
       <!-- 右侧：表格同步 -->
       <a-col :span="14">
-        <a-card title="表格同步" :bordered="false">
+        <a-card title="表格管理" :bordered="false">
           <template #extra>
             <a-tag v-if="selectedDatasource" color="blue">
               当前: {{ selectedDatasource.name }}
@@ -79,48 +79,56 @@
           </div>
 
           <div v-else>
-            <!-- 表格选择 -->
-            <a-spin :spinning="tablesLoading">
-              <a-checkbox-group v-model:value="selectedTables" style="width: 100%">
-                <a-row :gutter="[16, 8]">
-                  <a-col :span="8" v-for="table in remoteTables" :key="table.name">
-                    <a-checkbox :value="table.name">
-                      {{ table.name }}
-                      <a-tag size="small" v-if="table.row_count">{{ table.row_count }} 行</a-tag>
-                    </a-checkbox>
-                  </a-col>
-                </a-row>
-              </a-checkbox-group>
-            </a-spin>
+            <!-- 表格列表 -->
+            <a-table
+              :dataSource="remoteTables"
+              :columns="tableColumns"
+              :loading="tablesLoading"
+              :row-selection="{ selectedRowKeys: selectedTables, onChange: onTableSelectChange }"
+              :row-key="(record: any) => record.name"
+              size="small"
+              :pagination="{ pageSize: 10 }"
+            >
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'row_count'">
+                  <a-tag color="blue">{{ record.row_count || 0 }} 行</a-tag>
+                </template>
+                <template v-if="column.key === 'ai_enabled'">
+                  <a-switch
+                    :checked="getTableAIEnabled(record.name)"
+                    @change="(checked: boolean) => toggleTableAI(record.name, checked)"
+                    checked-children="开"
+                    un-checked-children="关"
+                  />
+                </template>
+                <template v-if="column.key === 'actions'">
+                  <a-space>
+                    <a-button type="link" size="small" @click="previewTable(record.name)">
+                      <eye-outlined /> 预览
+                    </a-button>
+                    <a-button type="link" size="small" @click="openScheduleConfig(record.name)">
+                      <setting-outlined /> 配置
+                    </a-button>
+                  </a-space>
+                </template>
+                <template v-if="column.key === 'schedule'">
+                  <span>{{ getTableScheduleDescription(record.name) }}</span>
+                </template>
+              </template>
+            </a-table>
 
             <a-divider />
 
-            <!-- 同步配置 -->
-            <a-form layout="inline" style="margin-bottom: 16px">
-              <a-form-item label="同步方式">
-                <a-radio-group v-model:value="syncMode">
-                  <a-radio value="immediate">立即同步</a-radio>
-                  <a-radio value="scheduled">定时同步</a-radio>
-                </a-radio-group>
-              </a-form-item>
-              <a-form-item v-if="syncMode === 'scheduled'" label="同步周期">
-                <a-select v-model:value="scheduleType" style="width: 120px">
-                  <a-select-option value="hourly">每小时</a-select-option>
-                  <a-select-option value="daily">每天</a-select-option>
-                  <a-select-option value="weekly">每周</a-select-option>
-                </a-select>
-              </a-form-item>
-            </a-form>
-
-            <a-button 
-              type="primary" 
-              size="large" 
-              block 
-              @click="startSync" 
+            <!-- 同步按钮 -->
+            <a-button
+              type="primary"
+              size="large"
+              block
+              @click="startSync"
               :loading="syncLoading"
               :disabled="selectedTables.length === 0"
             >
-              <sync-outlined /> 开始同步 ({{ selectedTables.length }} 张表)
+              <sync-outlined /> 同步选中表 ({{ selectedTables.length }} 张)
             </a-button>
 
             <!-- 同步结果 -->
@@ -137,14 +145,121 @@
         </a-card>
       </a-col>
     </a-row>
+
+    <!-- 表格预览弹窗 -->
+    <a-modal
+      v-model:open="previewModalVisible"
+      :title="'表格预览: ' + previewTableName"
+      width="90%"
+      :footer="null"
+    >
+      <a-spin :spinning="previewLoading">
+        <div v-if="previewData">
+          <a-descriptions title="表结构" bordered size="small" :column="4" style="margin-bottom: 16px">
+            <a-descriptions-item v-for="col in previewData.columns" :key="col.name" :label="col.name">
+              {{ col.full_type }} <span v-if="col.comment" style="color: #999">{{ col.comment }}</span>
+            </a-descriptions-item>
+          </a-descriptions>
+
+          <a-divider>数据预览 (共 {{ previewData.total_rows }} 行，显示前 {{ previewData.preview_rows }} 行)</a-divider>
+
+          <a-table
+            :dataSource="previewData.data"
+            :columns="previewColumns"
+            size="small"
+            :scroll="{ x: 'max-content', y: 400 }"
+            :pagination="false"
+          />
+        </div>
+      </a-spin>
+    </a-modal>
+
+    <!-- 同步策略配置弹窗 -->
+    <a-modal
+      v-model:open="scheduleModalVisible"
+      :title="'同步策略配置: ' + scheduleTableName"
+      @ok="saveScheduleConfig"
+      :confirm-loading="scheduleSaving"
+    >
+      <a-form :model="scheduleForm" layout="vertical">
+        <a-form-item label="同步类型">
+          <a-radio-group v-model:value="scheduleForm.schedule_type">
+            <a-radio value="hourly">每小时</a-radio>
+            <a-radio value="daily">每天</a-radio>
+            <a-radio value="weekly">每周</a-radio>
+            <a-radio value="monthly">每月</a-radio>
+          </a-radio-group>
+        </a-form-item>
+
+        <!-- 每小时：选择分钟 -->
+        <a-form-item v-if="scheduleForm.schedule_type === 'hourly'" label="执行分钟">
+          <a-select v-model:value="scheduleForm.schedule_minute" style="width: 120px">
+            <a-select-option v-for="m in 60" :key="m-1" :value="m-1">第 {{ m-1 }} 分钟</a-select-option>
+          </a-select>
+        </a-form-item>
+
+        <!-- 每天：选择时间 -->
+        <a-form-item v-if="scheduleForm.schedule_type === 'daily'" label="执行时间">
+          <a-time-picker
+            v-model:value="scheduleTimeValue"
+            format="HH:mm"
+            :minute-step="5"
+          />
+        </a-form-item>
+
+        <!-- 每周：选择周几和时间 -->
+        <a-form-item v-if="scheduleForm.schedule_type === 'weekly'" label="执行日期">
+          <a-space>
+            <a-select v-model:value="scheduleForm.schedule_day_of_week" style="width: 100px">
+              <a-select-option :value="1">周一</a-select-option>
+              <a-select-option :value="2">周二</a-select-option>
+              <a-select-option :value="3">周三</a-select-option>
+              <a-select-option :value="4">周四</a-select-option>
+              <a-select-option :value="5">周五</a-select-option>
+              <a-select-option :value="6">周六</a-select-option>
+              <a-select-option :value="7">周日</a-select-option>
+            </a-select>
+            <a-time-picker
+              v-model:value="scheduleTimeValue"
+              format="HH:mm"
+              :minute-step="5"
+            />
+          </a-space>
+        </a-form-item>
+
+        <!-- 每月：选择日期和时间 -->
+        <a-form-item v-if="scheduleForm.schedule_type === 'monthly'" label="执行日期">
+          <a-space>
+            <a-select v-model:value="scheduleForm.schedule_day_of_month" style="width: 100px">
+              <a-select-option v-for="d in 28" :key="d" :value="d">{{ d }} 号</a-select-option>
+            </a-select>
+            <a-time-picker
+              v-model:value="scheduleTimeValue"
+              format="HH:mm"
+              :minute-step="5"
+            />
+          </a-space>
+        </a-form-item>
+
+        <a-form-item label="AI分析">
+          <a-switch
+            v-model:checked="scheduleForm.enabled_for_ai"
+            checked-children="启用"
+            un-checked-children="禁用"
+          />
+          <span style="margin-left: 8px; color: #999">启用后，AI问答会查询此表数据</span>
+        </a-form-item>
+      </a-form>
+    </a-modal>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import { message } from 'ant-design-vue';
-import { SyncOutlined } from '@ant-design/icons-vue';
+import { SyncOutlined, EyeOutlined, SettingOutlined } from '@ant-design/icons-vue';
 import { dorisApi } from '../api/doris';
+import dayjs, { Dayjs } from 'dayjs';
 
 // 表单状态
 const formState = ref({
@@ -162,10 +277,9 @@ const datasources = ref<any[]>([]);
 const selectedDatasource = ref<any>(null);
 const remoteTables = ref<any[]>([]);
 const selectedTables = ref<string[]>([]);
+const syncTasks = ref<any[]>([]);
 
-// 同步配置
-const syncMode = ref('immediate');
-const scheduleType = ref('daily');
+// 同步结果
 const syncResult = ref<any>(null);
 
 // Loading 状态
@@ -174,6 +288,52 @@ const saveLoading = ref(false);
 const listLoading = ref(false);
 const tablesLoading = ref(false);
 const syncLoading = ref(false);
+
+// 表格列定义
+const tableColumns = [
+  { title: '表名', dataIndex: 'name', key: 'name' },
+  { title: '行数', dataIndex: 'row_count', key: 'row_count', width: 100 },
+  { title: 'AI分析', key: 'ai_enabled', width: 80 },
+  { title: '操作', key: 'actions', width: 150 },
+  { title: '同步策略', key: 'schedule', width: 150 },
+];
+
+// 预览相关
+const previewModalVisible = ref(false);
+const previewTableName = ref('');
+const previewLoading = ref(false);
+const previewData = ref<any>(null);
+const previewColumns = computed(() => {
+  if (!previewData.value?.columns) return [];
+  return previewData.value.columns.map((col: any) => ({
+    title: col.name,
+    dataIndex: col.name,
+    key: col.name,
+    ellipsis: true,
+  }));
+});
+
+// 同步策略配置相关
+const scheduleModalVisible = ref(false);
+const scheduleTableName = ref('');
+const scheduleSaving = ref(false);
+const scheduleForm = ref({
+  schedule_type: 'daily',
+  schedule_minute: 0,
+  schedule_hour: 0,
+  schedule_day_of_week: 1,
+  schedule_day_of_month: 1,
+  enabled_for_ai: true,
+});
+const scheduleTimeValue = ref<Dayjs>(dayjs().hour(0).minute(0));
+
+// 监听时间选择器变化
+watch(scheduleTimeValue, (val) => {
+  if (val) {
+    scheduleForm.value.schedule_hour = val.hour();
+    scheduleForm.value.schedule_minute = val.minute();
+  }
+});
 
 // 计算属性
 const databaseOptions = computed(() =>
@@ -185,8 +345,7 @@ const syncResultDescription = computed(() => {
   if (syncResult.value.success) {
     return `成功同步 ${syncResult.value.success_count} 张表，共 ${syncResult.value.results?.reduce((sum: number, r: any) => sum + (r.rows_synced || 0), 0) || 0} 行数据`;
   }
-  
-  // 辅助函数：安全地将错误转换为字符串
+
   const formatError = (err: any): string => {
     if (!err) return '';
     if (typeof err === 'string') return err;
@@ -196,20 +355,17 @@ const syncResultDescription = computed(() => {
     return String(err);
   };
 
-  // 优先显示后端返回的顶层错误信息
   if (syncResult.value.error) {
     return formatError(syncResult.value.error);
   }
-  
-  // 尝试从 results 中查找失败的表
+
   if (syncResult.value.results && syncResult.value.results.length > 0) {
     const failed = syncResult.value.results.find((r: any) => !r.success);
     if (failed) {
       return `同步失败: ${formatError(failed.error) || '未知错误'}`;
     }
   }
-  
-  // 如果还是没有找到错误信息，显示原始数据的简减版
+
   return `未知错误 (原始数据: ${JSON.stringify(syncResult.value).substring(0, 200)}...)`;
 });
 
@@ -285,8 +441,12 @@ const selectDataSource = async (ds: any) => {
 
   tablesLoading.value = true;
   try {
-    const response = await dorisApi.datasource.getTables(ds.id);
-    remoteTables.value = response.data.tables || [];
+    const [tablesRes, tasksRes] = await Promise.all([
+      dorisApi.datasource.getTables(ds.id),
+      dorisApi.syncTasks.list()
+    ]);
+    remoteTables.value = tablesRes.data.tables || [];
+    syncTasks.value = tasksRes.data.tasks || [];
   } catch (error: any) {
     message.error('获取表列表失败: ' + (error.response?.data?.detail || error.message));
   } finally {
@@ -309,7 +469,155 @@ const deleteDataSource = async (dsId: string) => {
   }
 };
 
-// 开始同步
+// 表格选择变化
+const onTableSelectChange = (keys: string[]) => {
+  selectedTables.value = keys;
+};
+
+// 获取表的AI启用状态
+const getTableAIEnabled = (tableName: string): boolean => {
+  const task = syncTasks.value.find((t: any) => t.source_table === tableName);
+  return task?.enabled_for_ai ?? true;
+};
+
+// 切换表的AI启用状态
+const toggleTableAI = async (tableName: string, enabled: boolean) => {
+  const task = syncTasks.value.find((t: any) => t.source_table === tableName);
+  if (task) {
+    try {
+      await dorisApi.syncTasks.toggleAI(task.id, enabled);
+      task.enabled_for_ai = enabled;
+      message.success(`${tableName} AI分析已${enabled ? '启用' : '禁用'}`);
+    } catch (error: any) {
+      message.error('操作失败: ' + (error.response?.data?.detail || error.message));
+    }
+  } else {
+    message.info('请先配置此表的同步策略');
+  }
+};
+
+// 获取表的同步策略描述
+const getTableScheduleDescription = (tableName: string): string => {
+  const task = syncTasks.value.find((t: any) => t.source_table === tableName);
+  if (!task) return '--';
+
+  const weekdays = ['', '周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  const hour = task.schedule_hour ?? 0;
+  const minute = task.schedule_minute ?? 0;
+  const timeStr = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+
+  switch (task.schedule_type) {
+    case 'hourly': return `每小时第${minute}分钟`;
+    case 'daily': return `每天 ${timeStr}`;
+    case 'weekly': return `每${weekdays[task.schedule_day_of_week || 1]} ${timeStr}`;
+    case 'monthly': return `每月${task.schedule_day_of_month || 1}号 ${timeStr}`;
+    default: return task.schedule_type;
+  }
+};
+
+// 预览表格
+const previewTable = async (tableName: string) => {
+  if (!selectedDatasource.value) return;
+
+  previewTableName.value = tableName;
+  previewModalVisible.value = true;
+  previewLoading.value = true;
+  previewData.value = null;
+
+  try {
+    const response = await dorisApi.datasource.previewTable(
+      selectedDatasource.value.id,
+      tableName,
+      100
+    );
+    previewData.value = response.data;
+  } catch (error: any) {
+    message.error('预览失败: ' + (error.response?.data?.detail || error.message));
+    previewModalVisible.value = false;
+  } finally {
+    previewLoading.value = false;
+  }
+};
+
+// 打开同步策略配置弹窗
+const openScheduleConfig = (tableName: string) => {
+  scheduleTableName.value = tableName;
+
+  // 查找现有配置
+  const task = syncTasks.value.find((t: any) => t.source_table === tableName);
+  if (task) {
+    scheduleForm.value = {
+      schedule_type: task.schedule_type || 'daily',
+      schedule_minute: task.schedule_minute || 0,
+      schedule_hour: task.schedule_hour || 0,
+      schedule_day_of_week: task.schedule_day_of_week || 1,
+      schedule_day_of_month: task.schedule_day_of_month || 1,
+      enabled_for_ai: task.enabled_for_ai ?? true,
+    };
+    scheduleTimeValue.value = dayjs().hour(task.schedule_hour || 0).minute(task.schedule_minute || 0);
+  } else {
+    // 默认配置
+    scheduleForm.value = {
+      schedule_type: 'daily',
+      schedule_minute: 0,
+      schedule_hour: 3,
+      schedule_day_of_week: 1,
+      schedule_day_of_month: 1,
+      enabled_for_ai: true,
+    };
+    scheduleTimeValue.value = dayjs().hour(3).minute(0);
+  }
+
+  scheduleModalVisible.value = true;
+};
+
+// 保存同步策略配置
+const saveScheduleConfig = async () => {
+  if (!selectedDatasource.value) return;
+
+  scheduleSaving.value = true;
+  try {
+    const existingTask = syncTasks.value.find((t: any) => t.source_table === scheduleTableName.value);
+
+    if (existingTask) {
+      // 更新现有任务
+      await dorisApi.syncTasks.update(existingTask.id, {
+        schedule_type: scheduleForm.value.schedule_type,
+        schedule_minute: scheduleForm.value.schedule_minute,
+        schedule_hour: scheduleForm.value.schedule_hour,
+        schedule_day_of_week: scheduleForm.value.schedule_day_of_week,
+        schedule_day_of_month: scheduleForm.value.schedule_day_of_month,
+        enabled_for_ai: scheduleForm.value.enabled_for_ai,
+      });
+      message.success('同步策略已更新');
+    } else {
+      // 创建新任务
+      await dorisApi.syncTasks.create({
+        datasource_id: selectedDatasource.value.id,
+        source_table: scheduleTableName.value,
+        schedule_type: scheduleForm.value.schedule_type as any,
+        schedule_minute: scheduleForm.value.schedule_minute,
+        schedule_hour: scheduleForm.value.schedule_hour,
+        schedule_day_of_week: scheduleForm.value.schedule_day_of_week,
+        schedule_day_of_month: scheduleForm.value.schedule_day_of_month,
+        enabled_for_ai: scheduleForm.value.enabled_for_ai,
+      });
+      message.success('同步策略已创建');
+    }
+
+    // 刷新任务列表
+    const tasksRes = await dorisApi.syncTasks.list();
+    syncTasks.value = tasksRes.data.tasks || [];
+
+    scheduleModalVisible.value = false;
+  } catch (error: any) {
+    message.error('保存失败: ' + (error.response?.data?.detail || error.message));
+  } finally {
+    scheduleSaving.value = false;
+  }
+};
+
+// 开始同步（立即同步选中的表）
 const startSync = async () => {
   if (!selectedDatasource.value || selectedTables.value.length === 0) {
     message.warning('请选择要同步的表');
@@ -320,37 +628,14 @@ const startSync = async () => {
   syncResult.value = null;
 
   try {
-    if (syncMode.value === 'scheduled') {
-      // 定时同步：为每个表创建定时任务
-      let successCount = 0;
-      for (const tableName of selectedTables.value) {
-        try {
-          await dorisApi.syncTasks.create({
-            datasource_id: selectedDatasource.value.id,
-            source_table: tableName,
-            schedule_type: scheduleType.value as 'hourly' | 'daily' | 'weekly'
-          });
-          successCount++;
-        } catch (e) {
-          console.error(`创建定时任务失败: ${tableName}`, e);
-        }
-      }
-      syncResult.value = {
-        success: successCount > 0,
-        message: `已创建 ${successCount} 个定时同步任务（${scheduleType.value}）`
-      };
-      message.success(`已创建 ${successCount} 个定时同步任务`);
-    } else {
-      // 立即同步
-      const tables = selectedTables.value.map(name => ({ source_table: name }));
-      const response = await dorisApi.datasource.syncMultiple(selectedDatasource.value.id, tables);
-      syncResult.value = response.data;
+    const tables = selectedTables.value.map(name => ({ source_table: name }));
+    const response = await dorisApi.datasource.syncMultiple(selectedDatasource.value.id, tables);
+    syncResult.value = response.data;
 
-      if (response.data.success) {
-        message.success(`同步完成！成功 ${response.data.success_count} 张表`);
-      } else {
-        message.warning(`同步部分失败：成功 ${response.data.success_count}，失败 ${response.data.fail_count}`);
-      }
+    if (response.data.success) {
+      message.success(`同步完成！成功 ${response.data.success_count} 张表`);
+    } else {
+      message.warning(`同步部分失败：成功 ${response.data.success_count}，失败 ${response.data.fail_count}`);
     }
   } catch (error: any) {
     syncResult.value = { success: false, error: error.response?.data?.detail || error.message };

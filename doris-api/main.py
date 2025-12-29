@@ -771,14 +771,55 @@ async def sync_multiple_tables(ds_id: str, req: SyncMultipleRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============ 表预览 API ============
+
+@app.get("/api/datasource/{ds_id}/tables/{table_name}/preview")
+async def preview_datasource_table(ds_id: str, table_name: str, limit: int = 100):
+    """预览远程表的结构和数据"""
+    try:
+        ds = datasource_handler.get_datasource(ds_id)
+        if not ds:
+            raise HTTPException(status_code=404, detail="数据源不存在")
+
+        result = datasource_handler.preview_remote_table(
+            host=ds['host'],
+            port=ds['port'],
+            user=ds['user'],
+            password=ds['password'],
+            database=ds['database_name'],
+            table_name=table_name,
+            limit=limit
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============ 同步任务调度 API ============
 
 class ScheduleSyncRequest(BaseModel):
-    """定时同步请求"""
+    """定时同步请求（增强版）"""
     datasource_id: str = Field(..., description="数据源ID")
     source_table: str = Field(..., description="源表名")
     target_table: Optional[str] = Field(None, description="目标表名")
-    schedule_type: str = Field(..., description="调度类型: hourly/daily/weekly")
+    schedule_type: str = Field(..., description="调度类型: hourly/daily/weekly/monthly")
+    schedule_minute: Optional[int] = Field(0, description="分钟 (0-59)")
+    schedule_hour: Optional[int] = Field(0, description="小时 (0-23)")
+    schedule_day_of_week: Optional[int] = Field(1, description="周几 (1-7, 1=周一)")
+    schedule_day_of_month: Optional[int] = Field(1, description="日期 (1-31)")
+    enabled_for_ai: Optional[bool] = Field(True, description="是否启用AI分析")
+
+
+class UpdateSyncTaskRequest(BaseModel):
+    """更新同步任务请求"""
+    schedule_type: Optional[str] = Field(None, description="调度类型")
+    schedule_minute: Optional[int] = Field(None, description="分钟")
+    schedule_hour: Optional[int] = Field(None, description="小时")
+    schedule_day_of_week: Optional[int] = Field(None, description="周几")
+    schedule_day_of_month: Optional[int] = Field(None, description="日期")
+    enabled_for_ai: Optional[bool] = Field(None, description="是否启用AI分析")
 
 
 @app.post("/api/sync/schedule")
@@ -789,8 +830,41 @@ async def create_sync_schedule(req: ScheduleSyncRequest):
             ds_id=req.datasource_id,
             source_table=req.source_table,
             target_table=req.target_table,
-            schedule_type=req.schedule_type
+            schedule_type=req.schedule_type,
+            schedule_minute=req.schedule_minute or 0,
+            schedule_hour=req.schedule_hour or 0,
+            schedule_day_of_week=req.schedule_day_of_week or 1,
+            schedule_day_of_month=req.schedule_day_of_month or 1,
+            enabled_for_ai=req.enabled_for_ai if req.enabled_for_ai is not None else True
         )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/sync/tasks/{task_id}")
+async def update_sync_task(task_id: str, req: UpdateSyncTaskRequest):
+    """更新同步任务配置"""
+    try:
+        result = datasource_handler.update_sync_task(
+            task_id=task_id,
+            schedule_type=req.schedule_type,
+            schedule_minute=req.schedule_minute,
+            schedule_hour=req.schedule_hour,
+            schedule_day_of_week=req.schedule_day_of_week,
+            schedule_day_of_month=req.schedule_day_of_month,
+            enabled_for_ai=req.enabled_for_ai
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/sync/tasks/{task_id}/toggle-ai")
+async def toggle_task_ai(task_id: str, enabled: bool):
+    """切换同步任务的AI分析启用状态"""
+    try:
+        result = datasource_handler.toggle_ai_enabled(task_id, enabled)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -805,6 +879,20 @@ async def list_sync_tasks():
             "success": True,
             "tasks": tasks,
             "count": len(tasks)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sync/ai-enabled-tables")
+async def get_ai_enabled_tables():
+    """获取所有启用AI分析的表名"""
+    try:
+        tables = datasource_handler.get_ai_enabled_tables()
+        return {
+            "success": True,
+            "tables": tables,
+            "count": len(tables)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

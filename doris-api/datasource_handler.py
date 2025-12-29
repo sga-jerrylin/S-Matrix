@@ -37,7 +37,7 @@ class DataSourceHandler:
 
     def _ensure_system_tables(self):
         """确保系统表存在"""
-        # 数据源配置表
+        # 数据源配置表 - 使用 UNIQUE KEY 以支持 UPDATE/DELETE
         sql_datasources = """
         CREATE TABLE IF NOT EXISTS `_sys_datasources` (
             `id` VARCHAR(64),
@@ -50,12 +50,12 @@ class DataSourceHandler:
             `created_at` DATETIME,
             `updated_at` DATETIME
         )
-        DUPLICATE KEY(`id`)
+        UNIQUE KEY(`id`)
         DISTRIBUTED BY HASH(`id`) BUCKETS 1
         PROPERTIES ("replication_num" = "1")
         """
-        
-        # 同步任务表
+
+        # 同步任务表 - 使用 UNIQUE KEY 以支持 UPDATE/DELETE
         sql_sync_tasks = """
         CREATE TABLE IF NOT EXISTS `_sys_sync_tasks` (
             `id` VARCHAR(64),
@@ -63,18 +63,23 @@ class DataSourceHandler:
             `source_table` VARCHAR(200),
             `target_table` VARCHAR(200),
             `schedule_type` VARCHAR(50),
+            `schedule_minute` INT DEFAULT "0",
+            `schedule_hour` INT DEFAULT "0",
+            `schedule_day_of_week` INT DEFAULT "1",
+            `schedule_day_of_month` INT DEFAULT "1",
             `schedule_value` VARCHAR(100),
             `last_sync_at` DATETIME,
             `next_sync_at` DATETIME,
             `status` VARCHAR(50),
+            `enabled_for_ai` TINYINT DEFAULT "1",
             `created_at` DATETIME
         )
-        DUPLICATE KEY(`id`)
+        UNIQUE KEY(`id`)
         DISTRIBUTED BY HASH(`id`) BUCKETS 1
         PROPERTIES ("replication_num" = "1")
         """
-        
-        # 表元数据表
+
+        # 表元数据表 - 使用 UNIQUE KEY 以支持 UPDATE/DELETE
         sql_metadata = """
         CREATE TABLE IF NOT EXISTS `_sys_table_metadata` (
             `table_name` VARCHAR(200),
@@ -84,17 +89,27 @@ class DataSourceHandler:
             `analyzed_at` DATETIME,
             `source_type` VARCHAR(50)
         )
-        DUPLICATE KEY(`table_name`)
+        UNIQUE KEY(`table_name`)
         DISTRIBUTED BY HASH(`table_name`) BUCKETS 1
         PROPERTIES ("replication_num" = "1")
         """
         
-        try:
-            self.db.execute_update(sql_datasources)
-            self.db.execute_update(sql_sync_tasks)
-            self.db.execute_update(sql_metadata)
-        except Exception as e:
-            print(f"Warning: Could not create system tables: {e}")
+        import time
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                self.db.execute_update(sql_datasources)
+                self.db.execute_update(sql_sync_tasks)
+                self.db.execute_update(sql_metadata)
+                print("✅ 系统表创建成功")
+                return
+            except Exception as e:
+                error_msg = str(e)
+                if "available backend num is 0" in error_msg and attempt < max_retries - 1:
+                    print(f"⏳ BE 尚未就绪，等待重试... ({attempt + 1}/{max_retries})")
+                    time.sleep(5)
+                else:
+                    print(f"Warning: Could not create system tables: {e}")
     
     def _encrypt_password(self, password: str) -> str:
         """加密密码"""
@@ -175,6 +190,57 @@ class DataSourceHandler:
                 'success': False,
                 'error': str(e),
                 'tables': []
+            }
+
+    def preview_remote_table(self, host: str, port: int, user: str,
+                              password: str, database: str, table_name: str,
+                              limit: int = 100) -> Dict[str, Any]:
+        """预览远程表的结构和数据"""
+        try:
+            conn = pymysql.connect(
+                host=host, port=port, user=user,
+                password=password, database=database,
+                connect_timeout=10
+            )
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
+
+            # 获取表结构
+            cursor.execute(f"""
+                SELECT
+                    COLUMN_NAME as name,
+                    DATA_TYPE as type,
+                    COLUMN_TYPE as full_type,
+                    IS_NULLABLE as nullable,
+                    COLUMN_COMMENT as comment
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                ORDER BY ORDINAL_POSITION
+            """, (database, table_name))
+            columns = cursor.fetchall()
+
+            # 获取前100行数据
+            cursor.execute(f"SELECT * FROM `{table_name}` LIMIT %s", (limit,))
+            data = cursor.fetchall()
+
+            # 获取总行数
+            cursor.execute(f"SELECT COUNT(*) as total FROM `{table_name}`")
+            total = cursor.fetchone()['total']
+
+            cursor.close()
+            conn.close()
+
+            return {
+                'success': True,
+                'table_name': table_name,
+                'columns': columns,
+                'data': data,
+                'total_rows': total,
+                'preview_rows': len(data)
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
             }
 
     def save_datasource(self, name: str, host: str, port: int,
@@ -352,50 +418,175 @@ class DataSourceHandler:
         return response
 
     def save_sync_task(self, ds_id: str, source_table: str,
-                       target_table: str, schedule_type: str) -> Dict[str, Any]:
-        """保存同步任务配置"""
+                       target_table: str, schedule_type: str,
+                       schedule_minute: int = 0, schedule_hour: int = 0,
+                       schedule_day_of_week: int = 1, schedule_day_of_month: int = 1,
+                       enabled_for_ai: bool = True) -> Dict[str, Any]:
+        """
+        保存同步任务配置（增强版）
+
+        Args:
+            ds_id: 数据源ID
+            source_table: 源表名
+            target_table: 目标表名
+            schedule_type: 调度类型 (hourly/daily/weekly/monthly)
+            schedule_minute: 分钟 (0-59)
+            schedule_hour: 小时 (0-23)
+            schedule_day_of_week: 周几 (1-7, 1=周一)
+            schedule_day_of_month: 日期 (1-31)
+            enabled_for_ai: 是否启用AI分析
+        """
         import uuid
 
         task_id = str(uuid.uuid4())[:8]
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         # 计算下次同步时间
-        next_sync = self._calculate_next_sync(schedule_type)
+        next_sync = self._calculate_next_sync_detailed(
+            schedule_type, schedule_minute, schedule_hour,
+            schedule_day_of_week, schedule_day_of_month
+        )
 
         sql = """
         INSERT INTO `_sys_sync_tasks`
         (`id`, `datasource_id`, `source_table`, `target_table`,
-         `schedule_type`, `schedule_value`, `last_sync_at`, `next_sync_at`,
-         `status`, `created_at`)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         `schedule_type`, `schedule_minute`, `schedule_hour`,
+         `schedule_day_of_week`, `schedule_day_of_month`,
+         `schedule_value`, `last_sync_at`, `next_sync_at`,
+         `status`, `enabled_for_ai`, `created_at`)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         self.db.execute_update(sql, (
             task_id, ds_id, source_table, target_table or source_table,
-            schedule_type, '', now, next_sync, 'active', now
+            schedule_type, schedule_minute, schedule_hour,
+            schedule_day_of_week, schedule_day_of_month,
+            '', now, next_sync, 'active', 1 if enabled_for_ai else 0, now
         ))
 
         return {
             'success': True,
             'task_id': task_id,
-            'next_sync_at': next_sync
+            'next_sync_at': next_sync,
+            'schedule_description': self._get_schedule_description(
+                schedule_type, schedule_minute, schedule_hour,
+                schedule_day_of_week, schedule_day_of_month
+            )
         }
 
-    def _calculate_next_sync(self, schedule_type: str) -> str:
-        """计算下次同步时间"""
+    def update_sync_task(self, task_id: str, schedule_type: str = None,
+                         schedule_minute: int = None, schedule_hour: int = None,
+                         schedule_day_of_week: int = None, schedule_day_of_month: int = None,
+                         enabled_for_ai: bool = None) -> Dict[str, Any]:
+        """更新同步任务配置"""
+        updates = []
+        params = []
+
+        if schedule_type is not None:
+            updates.append("schedule_type = %s")
+            params.append(schedule_type)
+        if schedule_minute is not None:
+            updates.append("schedule_minute = %s")
+            params.append(schedule_minute)
+        if schedule_hour is not None:
+            updates.append("schedule_hour = %s")
+            params.append(schedule_hour)
+        if schedule_day_of_week is not None:
+            updates.append("schedule_day_of_week = %s")
+            params.append(schedule_day_of_week)
+        if schedule_day_of_month is not None:
+            updates.append("schedule_day_of_month = %s")
+            params.append(schedule_day_of_month)
+        if enabled_for_ai is not None:
+            updates.append("enabled_for_ai = %s")
+            params.append(1 if enabled_for_ai else 0)
+
+        if not updates:
+            return {'success': False, 'error': '没有要更新的字段'}
+
+        params.append(task_id)
+        sql = f"UPDATE `_sys_sync_tasks` SET {', '.join(updates)} WHERE id = %s"
+        self.db.execute_update(sql, tuple(params))
+
+        return {'success': True, 'message': '任务已更新'}
+
+    def toggle_ai_enabled(self, task_id: str, enabled: bool) -> Dict[str, Any]:
+        """切换表的AI分析启用状态"""
+        sql = "UPDATE `_sys_sync_tasks` SET enabled_for_ai = %s WHERE id = %s"
+        self.db.execute_update(sql, (1 if enabled else 0, task_id))
+        return {
+            'success': True,
+            'enabled_for_ai': enabled,
+            'message': f'AI分析已{"启用" if enabled else "禁用"}'
+        }
+
+    def get_ai_enabled_tables(self) -> List[str]:
+        """获取所有启用AI分析的表名"""
+        sql = "SELECT DISTINCT target_table FROM `_sys_sync_tasks` WHERE enabled_for_ai = 1"
+        results = self.db.execute_query(sql)
+        return [r['target_table'] for r in results]
+
+    def _get_schedule_description(self, schedule_type: str, minute: int, hour: int,
+                                   day_of_week: int, day_of_month: int) -> str:
+        """生成调度描述"""
+        weekdays = ['', '周一', '周二', '周三', '周四', '周五', '周六', '周日']
+        time_str = f"{hour:02d}:{minute:02d}"
+
+        if schedule_type == 'hourly':
+            return f"每小时第{minute}分钟"
+        elif schedule_type == 'daily':
+            return f"每天 {time_str}"
+        elif schedule_type == 'weekly':
+            return f"每{weekdays[day_of_week]} {time_str}"
+        elif schedule_type == 'monthly':
+            return f"每月{day_of_month}号 {time_str}"
+        return schedule_type
+
+    def _calculate_next_sync_detailed(self, schedule_type: str, minute: int, hour: int,
+                                       day_of_week: int, day_of_month: int) -> str:
+        """计算下次同步时间（详细版）"""
         from datetime import timedelta
 
         now = datetime.now()
+
         if schedule_type == 'hourly':
-            next_time = now + timedelta(hours=1)
+            # 下一个小时的第N分钟
+            next_time = now.replace(minute=minute, second=0, microsecond=0)
+            if next_time <= now:
+                next_time += timedelta(hours=1)
+
         elif schedule_type == 'daily':
-            next_time = now + timedelta(days=1)
+            # 明天的指定时间
+            next_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if next_time <= now:
+                next_time += timedelta(days=1)
+
         elif schedule_type == 'weekly':
-            next_time = now + timedelta(weeks=1)
+            # 下一个指定周几的指定时间
+            next_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            days_ahead = day_of_week - now.isoweekday()
+            if days_ahead < 0 or (days_ahead == 0 and next_time <= now):
+                days_ahead += 7
+            next_time += timedelta(days=days_ahead)
+
+        elif schedule_type == 'monthly':
+            # 下个月的指定日期时间
+            next_time = now.replace(day=min(day_of_month, 28), hour=hour,
+                                     minute=minute, second=0, microsecond=0)
+            if next_time <= now:
+                # 移到下个月
+                if now.month == 12:
+                    next_time = next_time.replace(year=now.year + 1, month=1)
+                else:
+                    next_time = next_time.replace(month=now.month + 1)
         else:
             next_time = now + timedelta(days=1)
 
         return next_time.strftime('%Y-%m-%d %H:%M:%S')
+
+    def _calculate_next_sync(self, schedule_type: str) -> str:
+        """计算下次同步时间（简化版，保持向后兼容）"""
+        return self._calculate_next_sync_detailed(schedule_type, 0, 0, 1, 1)
 
     def list_sync_tasks(self) -> List[Dict[str, Any]]:
         """获取所有同步任务"""

@@ -1,25 +1,25 @@
-# Apache Doris 4.0 Docker Compose 配置
+# S-Matrix - Apache Doris 4.0 Docker Compose 配置
 # 简化版本：1 FE + 1 BE 用于开发测试
 
 services:
   # Frontend (FE) - 元数据管理和查询协调
-  doris-fe:
+  smatrix-fe:
     image: apache/doris:fe-4.0.0
-    container_name: doris-fe
-    hostname: doris-fe
+    container_name: smatrix-fe
+    hostname: smatrix-fe
     environment:
-      - FE_SERVERS=fe1:192.168.88.2:9010
+      - FE_SERVERS=fe1:192.168.99.2:9010
       - FE_ID=1
     ports:
-      - "18030:8030"   # HTTP 端口 - Web UI
-      - "19030:9030"   # MySQL 协议端口 - 客户端连接
-      - "19010:9010"   # FE 内部通信端口
+      - "38030:8030"   # HTTP 端口 - Web UI
+      - "39030:9030"   # MySQL 协议端口 - 客户端连接
+      - "39010:9010"   # FE 内部通信端口
     volumes:
       - doris-fe-meta:/opt/apache-doris/fe/doris-meta
       - doris-fe-log:/opt/apache-doris/fe/log
     networks:
-      doris-network:
-        ipv4_address: 192.168.88.2
+      smatrix-network:
+        ipv4_address: 192.168.99.2
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8030/api/bootstrap"]
       interval: 30s
@@ -28,26 +28,26 @@ services:
       start_period: 60s
 
   # Backend (BE) - 数据存储和查询执行
-  doris-be:
+  smatrix-be:
     image: apache/doris:be-4.0.0
-    container_name: doris-be
-    hostname: doris-be
+    container_name: smatrix-be
+    hostname: smatrix-be
     depends_on:
-      doris-fe:
+      smatrix-fe:
         condition: service_healthy
     environment:
-      - FE_SERVERS=fe1:192.168.88.2:9010
-      - BE_ADDR=192.168.88.3:9050
+      - FE_SERVERS=fe1:192.168.99.2:9010
+      - BE_ADDR=192.168.99.3:9050
     ports:
-      - "18040:8040"   # BE HTTP 端口
-      - "19050:9050"   # BE 心跳端口
-      - "19060:9060"   # BE Thrift 端口
+      - "38040:8040"   # BE HTTP 端口
+      - "39050:9050"   # BE 心跳端口
+      - "39060:9060"   # BE Thrift 端口
     volumes:
       - doris-be-storage:/opt/apache-doris/be/storage
       - doris-be-log:/opt/apache-doris/be/log
     networks:
-      doris-network:
-        ipv4_address: 192.168.88.3
+      smatrix-network:
+        ipv4_address: 192.168.99.3
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8040/api/health"]
       interval: 30s
@@ -56,25 +56,25 @@ services:
       start_period: 60s
 
   # API Gateway
-  doris-api:
+  smatrix-api:
     build: ./doris-api
-    container_name: doris-api
+    container_name: smatrix-api
     ports:
-      - "8018:8000"
+      - "38018:8000"
     networks:
-      - doris-network
+      - smatrix-network
     depends_on:
-      doris-fe:
+      smatrix-fe:
         condition: service_healthy
-      doris-be:
+      smatrix-be:
         condition: service_healthy
     environment:
-      - DORIS_HOST=doris-fe
+      - DORIS_HOST=smatrix-fe
       - DORIS_PORT=9030
       - DORIS_USER=root
       - DORIS_PASSWORD=
       - DORIS_DATABASE=doris_db
-      - DORIS_STREAM_LOAD_HOST=doris-be
+      - DORIS_STREAM_LOAD_HOST=smatrix-be
       - DORIS_STREAM_LOAD_PORT=8040
       - DEEPSEEK_API_KEY=sk-748638f482f74b7392a6dafd89bdd307
       - DEEPSEEK_MODEL=deepseek-chat
@@ -83,25 +83,25 @@ services:
       - ENCRYPTION_KEY=dITsw-d5mJGd4qrPln29AldqAy8GCb4lMvvZvQGRBQU=
 
   # Frontend Web UI
-  doris-frontend:
+  smatrix-frontend:
     build:
       context: ./doris-frontend
       dockerfile: Dockerfile
-    container_name: doris-frontend
+    container_name: smatrix-frontend
     ports:
-      - "5173:80"
+      - "35173:80"
     networks:
-      - doris-network
+      - smatrix-network
     depends_on:
-      - doris-api
+      - smatrix-api
 
 networks:
-  doris-network:
+  smatrix-network:
     driver: bridge
     ipam:
       config:
-        - subnet: 192.168.88.0/24
-          gateway: 192.168.88.1
+        - subnet: 192.168.99.0/24
+          gateway: 192.168.99.1
 
 volumes:
   doris-fe-meta:

@@ -63,7 +63,21 @@ export interface ScheduleSyncRequest {
   datasource_id: string;
   source_table: string;
   target_table?: string;
-  schedule_type: 'hourly' | 'daily' | 'weekly';
+  schedule_type: 'hourly' | 'daily' | 'weekly' | 'monthly';
+  schedule_minute?: number;
+  schedule_hour?: number;
+  schedule_day_of_week?: number;
+  schedule_day_of_month?: number;
+  enabled_for_ai?: boolean;
+}
+
+export interface UpdateSyncTaskRequest {
+  schedule_type?: string;
+  schedule_minute?: number;
+  schedule_hour?: number;
+  schedule_day_of_week?: number;
+  schedule_day_of_month?: number;
+  enabled_for_ai?: boolean;
 }
 
 export const dorisApi = {
@@ -126,6 +140,9 @@ export const dorisApi = {
     delete: (dsId: string) => api.delete(`/api/datasource/${dsId}`),
     // 获取数据源表列表
     getTables: (dsId: string) => api.get(`/api/datasource/${dsId}/tables`),
+    // 预览表数据
+    previewTable: (dsId: string, tableName: string, limit: number = 100) =>
+      api.get(`/api/datasource/${dsId}/tables/${tableName}/preview?limit=${limit}`),
     // 同步单个表
     syncTable: (dsId: string, data: SyncTableRequest) =>
       api.post(`/api/datasource/${dsId}/sync`, data),
@@ -138,8 +155,15 @@ export const dorisApi = {
   syncTasks: {
     // 创建定时同步任务
     create: (data: ScheduleSyncRequest) => api.post('/api/sync/schedule', data),
+    // 更新同步任务
+    update: (taskId: string, data: UpdateSyncTaskRequest) => api.put(`/api/sync/tasks/${taskId}`, data),
+    // 切换AI启用状态
+    toggleAI: (taskId: string, enabled: boolean) =>
+      api.put(`/api/sync/tasks/${taskId}/toggle-ai?enabled=${enabled}`),
     // 获取所有任务
     list: () => api.get('/api/sync/tasks'),
+    // 获取AI启用的表
+    getAIEnabledTables: () => api.get('/api/sync/ai-enabled-tables'),
     // 删除任务
     delete: (taskId: string) => api.delete(`/api/sync/tasks/${taskId}`),
   },
