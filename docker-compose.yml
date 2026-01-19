@@ -9,7 +9,7 @@ services:
     hostname: smatrix-fe
     restart: always
     environment:
-      - FE_SERVERS=fe1:smatrix-fe:9010
+      - FE_SERVERS=fe1:192.168.100.2:9010
       - FE_ID=1
     ports:
       - "38030:8030"   # HTTP 端口 - Web UI
@@ -19,7 +19,8 @@ services:
       - ./data/fe/doris-meta:/opt/apache-doris/fe/doris-meta
       - ./data/fe/log:/opt/apache-doris/fe/log
     networks:
-      - smatrix-network
+      smatrix-network:
+        ipv4_address: 192.168.100.2
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8030/api/bootstrap"]
       interval: 30s
@@ -34,9 +35,11 @@ services:
     hostname: smatrix-be
     restart: always
     depends_on:
-      - smatrix-fe
+      smatrix-fe:
+        condition: service_healthy
     environment:
-      - FE_SERVERS=fe1:smatrix-fe:9010
+      - FE_SERVERS=fe1:192.168.100.2:9010
+      - BE_ADDR=192.168.100.3:9050
     ports:
       - "38040:8040"   # BE HTTP 端口
       - "39050:9050"   # BE 心跳端口
@@ -45,7 +48,8 @@ services:
       - ./data/be/storage:/opt/apache-doris/be/storage
       - ./data/be/log:/opt/apache-doris/be/log
     networks:
-      - smatrix-network
+      smatrix-network:
+        ipv4_address: 192.168.100.3
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8040/api/health"]
       interval: 30s
@@ -61,10 +65,13 @@ services:
     ports:
       - "38018:8000"
     networks:
-      - smatrix-network
+      smatrix-network:
+        ipv4_address: 192.168.100.4
     depends_on:
-      - smatrix-fe
-      - smatrix-be
+      smatrix-fe:
+        condition: service_healthy
+      smatrix-be:
+        condition: service_healthy
     environment:
       - DORIS_HOST=smatrix-fe
       - DORIS_PORT=9030
@@ -89,10 +96,15 @@ services:
     ports:
       - "35173:80"
     networks:
-      - smatrix-network
+      smatrix-network:
+        ipv4_address: 192.168.100.5
     depends_on:
       - smatrix-api
 
 networks:
   smatrix-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.100.0/24
+          gateway: 192.168.100.1
