@@ -1,8 +1,9 @@
 """
 Doris API Gateway - 主程序
 """
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 import uvicorn
@@ -24,6 +25,10 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+# Global readiness flag for Doris init to avoid 502s after reboot.
+doris_ready = False
+
 # CORS 配置
 app.add_middleware(
     CORSMiddleware,
@@ -36,27 +41,21 @@ app.add_middleware(
 
 # ============ 启动事件 ============
 
-@app.on_event("startup")
-async def startup_event():
-    """
-    应用启动时初始化数据库
-    """
+def _init_doris_sync():
     import time
     import pymysql
 
-    max_retries = 30
-    retry_interval = 2
+    retry_interval = int(os.getenv("DORIS_INIT_RETRY_INTERVAL", "2"))
+    db_name = DORIS_CONFIG["database"]
 
     print("=" * 60)
-    print("🚀 Doris API Gateway 启动中...")
+    print("Doris API Gateway starting...")
     print("=" * 60)
 
-    # 等待 Doris FE 就绪
-    for i in range(max_retries):
+    while True:
         try:
-            print(f"⏳ 等待 Doris FE 就绪... ({i+1}/{max_retries})")
+            print("Waiting for Doris FE...")
 
-            # 尝试连接到 Doris (不指定数据库)
             conn = pymysql.connect(
                 host=DORIS_CONFIG['host'],
                 port=DORIS_CONFIG['port'],
@@ -66,65 +65,80 @@ async def startup_event():
             )
 
             cursor = conn.cursor()
-            
-            # 1. 检查并注册 BE (针对新环境初始化)
+
             cursor.execute("SHOW BACKENDS")
             backends = cursor.fetchall()
             if not backends:
                 be_host = os.getenv('DORIS_STREAM_LOAD_HOST', 'doris-be')
-                be_heartbeat_port = 9050 # 默认心跳端口
-                print(f"⚙️  未发现已注册的 BE, 尝试自动注册: {be_host}:{be_heartbeat_port}")
+                be_heartbeat_port = 9050
+                print(f"No BE registered, trying to add: {be_host}:{be_heartbeat_port}")
                 try:
                     cursor.execute(f'ALTER SYSTEM ADD BACKEND "{be_host}:{be_heartbeat_port}"')
-                    print(f"✅ 已发送注册 BE 指令: {be_host}:{be_heartbeat_port}")
-                    # 注册后给一点时间让 BE 就绪
+                    print(f"Sent add BE: {be_host}:{be_heartbeat_port}")
                     time.sleep(5)
                 except Exception as be_err:
-                    print(f"⚠️  注册 BE 失败 (可能已存在或正在初始化): {be_err}")
+                    print(f"Add BE failed (may already exist): {be_err}")
 
-            # 2. 创建数据库
-            db_name = DORIS_CONFIG['database']
-            print(f"📦 创建数据库: {db_name}")
+            print(f"Ensure database {db_name}")
             cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`")
-            
-            # 验证数据库创建成功
+
             cursor.execute("SHOW DATABASES")
             databases = [row[0] for row in cursor.fetchall()]
 
             if db_name in databases:
-                print(f"✅ 数据库 '{db_name}' 已就绪")
+                print(f"Database '{db_name}' ready")
             else:
-                print(f"⚠️  数据库 '{db_name}' 创建失败")
+                print(f"Database '{db_name}' create failed")
 
             cursor.close()
             conn.close()
 
-            # 初始化系统表
             datasource_handler.init_tables()
-            print("✅ 系统表已初始化")
+            print("System tables initialized")
 
             print("=" * 60)
-            print("✅ Doris API Gateway 启动成功!")
-            print(f"📊 数据库: {db_name}")
-            print(f"🌐 API 地址: http://{API_HOST}:{API_PORT}")
-            print(f"📖 API 文档: http://{API_HOST}:{API_PORT}/docs")
+            print("Doris API Gateway ready")
+            print(f"Database: {db_name}")
+            print(f"API: http://{API_HOST}:{API_PORT}")
+            print(f"Docs: http://{API_HOST}:{API_PORT}/docs")
             print("=" * 60)
-            break
+            return True
 
         except Exception as e:
-            if i < max_retries - 1:
-                print(f"❌ 连接失败: {str(e)}")
-                print(f"⏳ {retry_interval} 秒后重试...")
-                time.sleep(retry_interval)
-            else:
-                print("=" * 60)
-                print("❌ 无法连接到 Doris FE,请检查配置")
-                print(f"错误: {str(e)}")
-                print("=" * 60)
-                raise
+            print(f"Connect failed: {e}")
+            print(f"Retry in {retry_interval}s...")
+            time.sleep(retry_interval)
 
-    # 启动同步调度器
-    sync_scheduler.start()
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Application startup initialization.
+    """
+    async def init_in_background():
+        global doris_ready
+        if doris_ready:
+            return
+        ready = await asyncio.to_thread(_init_doris_sync)
+        if ready:
+            doris_ready = True
+            sync_scheduler.start()
+
+    asyncio.create_task(init_in_background())
+
+
+@app.middleware("http")
+async def doris_ready_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api") and request.url.path != "/api/health":
+        if not doris_ready:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "message": "Doris FE is not ready yet, please retry later."
+                },
+            )
+    return await call_next(request)
 
 
 # ============ 数据模型 ============
