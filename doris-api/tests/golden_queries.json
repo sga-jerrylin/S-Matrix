@@ -2,8 +2,11 @@
   {
     "question": "广州有多少机构？",
     "expected_sql_pattern": "COUNT|count",
+    "expected_sql_contains": ["广州"],
+    "forbidden_sql_pattern": "SELECT\\s+\\*",
     "expected_min_rows": 1,
-    "expected_result_contains": ["广州"]
+    "allow_empty_result": false,
+    "expected_columns_any": ["count", "total", "COUNT(*)"]
   },
   {
     "question": "来自广州的机构",
@@ -14,8 +17,11 @@
   {
     "question": "2022年广东省收入超5万的机构有多少？",
     "expected_sql_pattern": "2022|收入|5",
-    "expected_min_rows": 0,
-    "expected_result_contains": ["广东"]
+    "expected_sql_contains": ["广东"],
+    "forbidden_sql_pattern": "SELECT\\s+\\*",
+    "expected_min_rows": 1,
+    "allow_empty_result": false,
+    "expected_columns_any": ["count", "total", "COUNT(*)"]
   },
   {
     "question": "2022年广州收入超5万的机构中，哪些参加了2023年的活动？",
@@ -26,7 +32,10 @@
   {
     "question": "不存在的测试城市有多少机构？",
     "expected_sql_pattern": "COUNT|count",
-    "expected_min_rows": 0,
+    "forbidden_sql_pattern": "SELECT\\s+\\*",
+    "expected_min_rows": 1,
+    "allow_empty_result": false,
+    "expected_columns_any": ["count", "total", "COUNT(*)"],
     "expected_result_contains": []
   }
 ]

@@ -4,14 +4,16 @@ Doris API Gateway - 主程序
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Dict, Any, List, Optional
 import uvicorn
 import traceback
 import os
+import re
 import asyncio
 import logging
 import inspect
+from urllib.parse import urlsplit, urlunsplit
 
 from config import API_HOST, API_PORT, DORIS_CONFIG
 from handlers import action_handler
@@ -49,6 +51,97 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _normalize_llm_resource(row_group: Dict[str, Any]) -> Dict[str, Any]:
+    properties = dict(row_group.get("properties") or {})
+    name = row_group.get("ResourceName") or row_group.get("Name") or ""
+    provider = (
+        properties.get("ai.provider_type")
+        or properties.get("provider")
+        or row_group.get("ResourceType")
+        or ""
+    )
+    model = properties.get("ai.model_name") or properties.get("model_name") or ""
+    endpoint = properties.get("ai.endpoint") or properties.get("endpoint") or ""
+    api_key_value = properties.get("ai.api_key") or properties.get("api_key") or ""
+    api_key_configured = bool(api_key_value and str(api_key_value).strip("* "))
+
+    if not api_key_configured and api_key_value:
+        api_key_configured = True
+
+    normalized = {
+        **row_group,
+        "name": name,
+        "provider": provider,
+        "model": model,
+        "endpoint": endpoint,
+        "api_key_configured": api_key_configured,
+        "properties": properties,
+    }
+    return normalized
+
+
+def load_llm_resources() -> List[Dict[str, Any]]:
+    sql = 'SHOW RESOURCES WHERE NAME LIKE "%"'
+    all_resources = doris_client.execute_query(sql)
+
+    resources_dict: Dict[str, Dict[str, Any]] = {}
+    for row in all_resources:
+        name = row.get('Name')
+        resource_type = row.get('ResourceType')
+        if resource_type != 'ai' or not name:
+            continue
+
+        if name not in resources_dict:
+            resources_dict[name] = {
+                'ResourceName': name,
+                'ResourceType': resource_type,
+                'properties': {}
+            }
+
+        item = row.get('Item')
+        value = row.get('Value')
+        if item and value is not None:
+            resources_dict[name]['properties'][item] = value
+
+    return [_normalize_llm_resource(resource) for resource in resources_dict.values()]
+
+
+def _derive_base_url(endpoint: str) -> str:
+    if not endpoint:
+        return ""
+
+    parts = urlsplit(endpoint)
+    path = parts.path or ""
+    suffix = "/chat/completions"
+    if path.endswith(suffix):
+        path = path[: -len(suffix)] or "/"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def resolve_llm_resource_config(resource_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    resources = load_llm_resources()
+    if not resources:
+        return None
+
+    selected = None
+    if resource_name:
+        selected = next((resource for resource in resources if resource.get("name") == resource_name), None)
+    if selected is None:
+        selected = resources[0]
+    if selected is None:
+        return None
+
+    endpoint = selected.get("endpoint") or ""
+    return {
+        "resource_name": selected.get("name"),
+        "provider": selected.get("provider"),
+        "model": selected.get("model"),
+        "endpoint": endpoint,
+        "base_url": _derive_base_url(endpoint),
+        "api_key_configured": selected.get("api_key_configured", False),
+    }
 
 
 # ============ 启动事件 ============
@@ -105,7 +198,11 @@ def _init_doris_sync():
             cursor.close()
             conn.close()
 
-            datasource_handler.init_tables()
+            if not datasource_handler.init_tables():
+                print("System tables are not ready yet")
+                print(f"Retry in {retry_interval}s...")
+                time.sleep(retry_interval)
+                continue
             print("System tables initialized")
 
             print("=" * 60)
@@ -193,15 +290,32 @@ class ExecuteRequest(BaseModel):
         }
 
 
+_RESOURCE_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,127}$')
+
+
+def _escape_sql_str(value: str) -> str:
+    """转义 SQL 字符串值中的单引号，防止注入。"""
+    return str(value).replace("'", "''")
+
+
 class LLMConfigRequest(BaseModel):
     """LLM 配置请求"""
-    resource_name: str = Field(..., description="资源名称")
+    resource_name: str = Field(..., description="资源名称（仅允许字母、数字、下划线、连字符）")
     provider_type: str = Field(..., description="厂商类型: openai/deepseek/qwen/zhipu/local等")
     endpoint: str = Field(..., description="API 端点")
     model_name: str = Field(..., description="模型名称")
     api_key: Optional[str] = Field(None, description="API 密钥")
     temperature: Optional[float] = Field(None, description="温度参数 0-1")
     max_tokens: Optional[int] = Field(None, description="最大 token 数")
+
+    @field_validator('resource_name')
+    @classmethod
+    def validate_resource_name(cls, v: str) -> str:
+        if not _RESOURCE_NAME_RE.match(v):
+            raise ValueError(
+                "resource_name 只允许字母开头，包含字母、数字、下划线或连字符，长度 1-128"
+            )
+        return v
 
     class Config:
         json_schema_extra = {
@@ -318,6 +432,20 @@ async def list_tables():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/query/catalog")
+async def get_query_catalog():
+    """获取面向业务语义的数据查询目录"""
+    try:
+        tables = await datasource_handler.list_query_catalog()
+        return {
+            "success": True,
+            "tables": tables,
+            "count": len(tables),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/tables/{table_name}/schema")
 async def get_table_schema(table_name: str):
     """获取表结构"""
@@ -341,15 +469,16 @@ async def create_llm_config(req: LLMConfigRequest):
         logger.error(f"=== Received request: provider={req.provider_type}, endpoint={req.endpoint}, model={req.model_name}")
 
         # 构造 CREATE RESOURCE SQL (Doris 4.0 使用 'ai' 类型和 'ai.' 前缀)
+        # 字符串值使用 _escape_sql_str 转义单引号，防止 SQL 注入
         properties = [
             "'type' = 'ai'",
-            f"'ai.provider_type' = '{req.provider_type}'",
-            f"'ai.endpoint' = '{req.endpoint}'",
-            f"'ai.model_name' = '{req.model_name}'"
+            f"'ai.provider_type' = '{_escape_sql_str(req.provider_type)}'",
+            f"'ai.endpoint' = '{_escape_sql_str(req.endpoint)}'",
+            f"'ai.model_name' = '{_escape_sql_str(req.model_name)}'"
         ]
 
         if req.api_key:
-            properties.append(f"'ai.api_key' = '{req.api_key}'")
+            properties.append(f"'ai.api_key' = '{_escape_sql_str(req.api_key)}'")
         if req.temperature is not None:
             properties.append(f"'ai.temperature' = {req.temperature}")
         if req.max_tokens is not None:
@@ -390,37 +519,7 @@ async def create_llm_config(req: LLMConfigRequest):
 async def list_llm_configs():
     """获取所有 LLM 配置"""
     try:
-        # Doris 4.0 的 SHOW RESOURCES 语法,使用 NAME LIKE 获取所有资源
-        sql = 'SHOW RESOURCES WHERE NAME LIKE "%"'
-        all_resources = doris_client.execute_query(sql)
-
-        # SHOW RESOURCES 返回的是每个资源的每个属性作为一行
-        # 需要按资源名称分组,并过滤出 AI 类型的资源
-        resources_dict = {}
-        for row in all_resources:
-            name = row.get('Name')
-            resource_type = row.get('ResourceType')
-
-            # 只处理 AI 类型的资源
-            if resource_type != 'ai':
-                continue
-
-            # 初始化资源对象 (使用前端期望的字段名)
-            if name not in resources_dict:
-                resources_dict[name] = {
-                    'ResourceName': name,
-                    'ResourceType': resource_type,
-                    'properties': {}
-                }
-
-            # 收集属性
-            item = row.get('Item')
-            value = row.get('Value')
-            if item and value:
-                resources_dict[name]['properties'][item] = value
-
-        # 转换为列表
-        llm_resources = list(resources_dict.values())
+        llm_resources = load_llm_resources()
 
         return {
             "success": True,
@@ -434,6 +533,8 @@ async def list_llm_configs():
 @app.post("/api/llm/config/{resource_name}/test")
 async def test_llm_config(resource_name: str):
     """测试 LLM 配置"""
+    if not _RESOURCE_NAME_RE.match(resource_name):
+        raise HTTPException(status_code=400, detail="Invalid resource_name format")
     try:
         # 使用简单的测试查询 (Doris 4.0 使用 AI_GENERATE 函数)
         sql = f"SELECT AI_GENERATE('{resource_name}', 'Hello') AS test_result"
@@ -457,6 +558,8 @@ async def test_llm_config(resource_name: str):
 @app.delete("/api/llm/config/{resource_name}")
 async def delete_llm_config(resource_name: str):
     """删除 LLM 配置"""
+    if not _RESOURCE_NAME_RE.match(resource_name):
+        raise HTTPException(status_code=400, detail="Invalid resource_name format")
     try:
         sql = f"DROP RESOURCE '{resource_name}'"
         doris_client.execute_update(sql)
@@ -498,10 +601,29 @@ async def natural_language_query(request: Dict[str, Any]):
         if not query:
             raise HTTPException(status_code=400, detail="Missing 'query' parameter")
 
+        requested_tables = request.get("table_names") or []
+        if isinstance(requested_tables, str):
+            requested_tables = [requested_tables]
+        requested_tables = [
+            str(table_name).strip()
+            for table_name in requested_tables
+            if str(table_name).strip()
+        ]
+
+        resource_config = resolve_llm_resource_config(request.get("resource_name"))
+
         # 获取 API 配置
         api_key = request.get('api_key') or os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_API_KEY')
-        model = request.get('model') or os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
-        base_url = request.get('base_url') or os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
+        model = (
+            request.get('model')
+            or (resource_config or {}).get("model")
+            or os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
+        )
+        base_url = (
+            request.get('base_url')
+            or (resource_config or {}).get("base_url")
+            or os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
+        )
 
         if not api_key:
             raise HTTPException(
@@ -512,29 +634,57 @@ async def natural_language_query(request: Dict[str, Any]):
         logger.info(f"=== Natural language query: {query}")
         logger.info(f"=== Using model: {model} at {base_url}")
 
-        api_config = {"api_key": api_key, "model": model, "base_url": base_url}
+        api_config = {
+            "api_key": api_key,
+            "model": model,
+            "base_url": base_url,
+            "resource_name": (resource_config or {}).get("resource_name"),
+            "endpoint": (resource_config or {}).get("endpoint"),
+            "provider": (resource_config or {}).get("provider"),
+        }
         try:
             tables_context = await datasource_handler.list_table_registry()
         except Exception as registry_error:
             logger.warning("failed to load table registry for planner, fallback to empty context: %s", registry_error)
             tables_context = []
 
+        if requested_tables:
+            requested_table_names = set(requested_tables)
+            filtered_tables_context = [
+                table
+                for table in tables_context
+                if table.get("table_name") in requested_table_names
+            ]
+            if not filtered_tables_context:
+                raise HTTPException(status_code=400, detail="Selected query scope does not match any registered tables")
+            tables_context = filtered_tables_context
+
         planner = PlannerAgent(tables_context=tables_context)
         plan = await asyncio.to_thread(planner.plan, query)
         subtasks = plan.get("subtasks") or [{"table": table, "question": query} for table in plan.get("tables", [])]
         table_admin = TableAdminAgent(doris_client_override=doris_client)
 
-        sql_map: Dict[str, str] = {}
-        for subtask in subtasks:
+        async def generate_subtask_sql(subtask: Dict[str, Any]) -> Optional[tuple[str, str]]:
             table_name = subtask.get("table")
             if not table_name:
-                continue
-            sql_map[table_name] = await asyncio.to_thread(
+                return None
+            sql = await asyncio.to_thread(
                 table_admin.generate_sql_for_subtask,
                 subtask,
                 query,
                 api_config,
             )
+            return table_name, sql
+
+        sql_results = await asyncio.gather(
+            *(generate_subtask_sql(subtask) for subtask in subtasks if subtask.get("table"))
+        )
+        sql_map: Dict[str, str] = {
+            table_name: sql
+            for item in sql_results
+            if item is not None
+            for table_name, sql in [item]
+        }
 
         if not sql_map:
             raise HTTPException(status_code=400, detail="Planner could not resolve any target tables")
@@ -733,7 +883,8 @@ async def upload_excel(
     file: UploadFile = File(...),
     table_name: str = Form(...),
     column_mapping: Optional[str] = Form(None),
-    create_table: str = Form("true")
+    create_table: str = Form("true"),
+    import_mode: str = Form("replace"),
 ):
     """
     上传 Excel 文件并导入到 Doris
@@ -743,6 +894,7 @@ async def upload_excel(
         table_name: 目标表名
         column_mapping: 列映射 JSON 字符串 (可选)
         create_table: 如果表不存在是否创建 (字符串 "true"/"false")
+        import_mode: 导入模式 replace/append
     """
     try:
         import json
@@ -761,16 +913,23 @@ async def upload_excel(
             file_content=content,
             table_name=table_name,
             column_mapping=mapping,
-            create_table_if_not_exists=create_table_bool
+            create_table_if_not_exists=create_table_bool,
+            import_mode=import_mode,
         )
+        actual_table_name = result.get('table') or table_name
         if result.get('success'):
-            await datasource_handler.ensure_table_registry_async(table_name, 'excel')
+            await datasource_handler.ensure_table_registry_async(actual_table_name, 'excel')
+            if result.get('table_replaced'):
+                await datasource_handler.reset_table_analysis_assets_async(
+                    actual_table_name,
+                    clear_relationships=True,
+                )
 
         # 自动触发元数据分析（异步，不阻塞返回）
         try:
             import asyncio
             if result.get('success'):
-                asyncio.create_task(_analyze_table_async(table_name, 'excel'))
+                asyncio.create_task(_analyze_table_async(actual_table_name, 'excel'))
         except Exception as analyze_error:
             print(f"⚠️ 元数据分析触发失败: {analyze_error}")
 
@@ -1193,6 +1352,30 @@ async def update_table_registry(table_name: str, req: UpdateTableRegistryRequest
         if not result.get('success'):
             raise HTTPException(status_code=400, detail=result.get('error'))
         return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/table-registry/{table_name}")
+async def delete_table_registry(
+    table_name: str,
+    drop_physical: bool = True,
+    cleanup_history: bool = True,
+):
+    """删除已注册表及其派生资产"""
+    try:
+        result = await datasource_handler.delete_registered_table_async(
+            table_name=table_name,
+            drop_physical=drop_physical,
+            cleanup_history=cleanup_history,
+        )
+        if not result.get('success'):
+            raise HTTPException(status_code=400, detail=result.get('error'))
+        return result
+    except ValueError as value_error:
+        raise HTTPException(status_code=400, detail=str(value_error))
     except HTTPException:
         raise
     except Exception as e:

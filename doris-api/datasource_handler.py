@@ -23,15 +23,19 @@ class DataSourceHandler:
     
     def __init__(self):
         self.db = doris_client
-        # 加密密钥 - 从环境变量获取
+        # 加密密钥 - 必须通过环境变量 ENCRYPTION_KEY 提供
+        # 生成方式：python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
         key = os.getenv('ENCRYPTION_KEY')
         if key:
-            # 使用环境变量中的密钥
             self.cipher = Fernet(key.encode() if isinstance(key, str) else key)
         else:
-            # 使用固定的默认密钥（仅用于开发环境）
-            default_key = b'***REDACTED-ENCRYPTION-KEY***='
-            self.cipher = Fernet(default_key)
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "ENCRYPTION_KEY 环境变量未设置：数据源密码将使用每次启动随机生成的临时密钥加密。"
+                "重启后将无法解密已存储的密码，请在 .env 中设置持久化的 ENCRYPTION_KEY。"
+                "生成命令：python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            )
+            self.cipher = Fernet(Fernet.generate_key())
         self._tables_initialized = False
 
     def init_tables(self):

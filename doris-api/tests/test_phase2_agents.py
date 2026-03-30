@@ -1,6 +1,9 @@
+import sys
+import types
 from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
+import requests
 
 from conftest import reload_main
 from metadata_analyzer import MetadataAnalyzer
@@ -115,3 +118,49 @@ def test_refresh_agent_assets_persists_agent_config_and_field_catalog(monkeypatc
 
     assert result["success"] is True
     assert len(analyzer.db.updates) >= 2
+
+
+def test_call_llm_uses_http_request_and_parses_markdown_json(monkeypatch):
+    analyzer = MetadataAnalyzer()
+    analyzer.api_key = "test-key"
+    analyzer.model = "deepseek-chat"
+    analyzer.base_url = "https://example.test"
+
+    fake_openai = types.SimpleNamespace(
+        OpenAI=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("OpenAI SDK should not be used"))
+    )
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    called = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "```json\n{\"description\":\"机构表\",\"columns\":{\"所在市\":\"城市\"}}\n```"
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        called["url"] = url
+        called["headers"] = headers
+        called["json"] = json
+        called["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    result = analyzer._call_llm("请分析这张表")
+
+    assert result["description"] == "机构表"
+    assert result["columns"]["所在市"] == "城市"
+    assert called["url"] == "https://example.test/chat/completions"
+    assert called["headers"]["Authorization"] == "Bearer test-key"
+    assert called["json"]["model"] == "deepseek-chat"

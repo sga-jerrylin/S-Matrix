@@ -20,6 +20,9 @@ class MetadataAnalyzer:
         self.api_key = os.getenv('DEEPSEEK_API_KEY') or os.getenv('OPENAI_API_KEY')
         self.model = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
         self.base_url = os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
+
+    def _json_dumps_safe(self, value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, default=str)
     
     async def analyze_table_async(self, table_name: str, source_type: str = 'excel') -> Dict[str, Any]:
         """异步分析表格元数据"""
@@ -122,24 +125,27 @@ class MetadataAnalyzer:
     
     def _call_llm(self, prompt: str) -> Dict[str, Any]:
         """调用 LLM API"""
-        from openai import OpenAI
-        
-        client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
+        import requests
+
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "你是一个数据分析专家，擅长分析数据表结构和用途。请用中文回答。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 2000,
+            },
+            timeout=60,
         )
-        
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "你是一个数据分析专家，擅长分析数据表结构和用途。请用中文回答。"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=2000
-        )
-        
-        content = response.choices[0].message.content
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
         
         # 尝试解析 JSON
         try:
@@ -226,8 +232,8 @@ class MetadataAnalyzer:
 
 表名: {table_name}
 表描述: {metadata.get('description', '')}
-字段说明: {json.dumps(metadata.get('columns_info', {}), ensure_ascii=False)}
-样本数据: {json.dumps(sample_data[:5], ensure_ascii=False)}
+字段说明: {self._json_dumps_safe(metadata.get('columns_info', {}))}
+样本数据: {self._json_dumps_safe(sample_data[:5])}
 
 返回 JSON:
 {{
@@ -277,7 +283,7 @@ class MetadataAnalyzer:
         safe_table_name = self.db.validate_identifier(table_name)
         sample_data = self.db.execute_query(f"SELECT * FROM {safe_table_name} LIMIT 10")
         source_hash = hashlib.md5(
-            json.dumps(metadata, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
         prompt = self._build_agent_prompt(table_name, metadata, sample_data)

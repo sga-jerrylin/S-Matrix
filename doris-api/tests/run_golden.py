@@ -3,11 +3,10 @@ Run golden natural-language query cases against the API.
 """
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
-import requests
+from golden_runner import build_headers, run_cases, summarize_results
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,52 +17,49 @@ def parse_args() -> argparse.Namespace:
         "--cases",
         default=str(Path(__file__).with_name("golden_queries.json")),
     )
+    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--min-pass-rate", type=float, default=1.0)
+    parser.add_argument("--min-passed", type=int, default=None)
+    parser.add_argument("--summary-file", default="")
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     cases = json.loads(Path(args.cases).read_text(encoding="utf-8"))
-    headers = {"Content-Type": "application/json"}
-    if args.api_key:
-        headers["Authorization"] = f"Bearer {args.api_key}"
-        headers["X-API-Key"] = args.api_key
+    headers = build_headers(args.api_key)
+    results = run_cases(cases, base_url=args.base_url, headers=headers, timeout=args.timeout)
+    summary = summarize_results(
+        results,
+        min_pass_rate=args.min_pass_rate,
+        min_passed=args.min_passed,
+    )
 
-    failures = []
-    for case in cases:
-        response = requests.post(
-            f"{args.base_url.rstrip('/')}/api/query/natural",
-            headers=headers,
-            json={"query": case["question"]},
-            timeout=120,
+    if args.summary_file:
+        Path(args.summary_file).write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
-        if response.status_code != 200:
-            failures.append({"question": case["question"], "error": f"HTTP {response.status_code}: {response.text}"})
-            continue
 
-        payload = response.json()
-        sql = payload.get("sql", "")
-        rows = payload.get("data", [])
-        serialized_rows = json.dumps(rows, ensure_ascii=False)
+    if args.verbose:
+        for result in results:
+            status = "PASS" if result["passed"] else "FAIL"
+            sys.stdout.write(f"[{status}] {result['question']}\n")
+            for error in result.get("errors", []):
+                sys.stdout.write(f"  - {error}\n")
 
-        if not re.search(case["expected_sql_pattern"], sql):
-            failures.append({"question": case["question"], "error": f"SQL pattern mismatch: {sql}"})
-            continue
-
-        if len(rows) < int(case.get("expected_min_rows", 0)):
-            failures.append({"question": case["question"], "error": f"row count {len(rows)} below expected minimum"})
-            continue
-
-        missing_values = [value for value in case.get("expected_result_contains", []) if value not in serialized_rows]
-        if missing_values:
-            failures.append({"question": case["question"], "error": f"missing expected values: {missing_values}"})
-
-    if failures:
-        sys.stdout.write(json.dumps({"success": False, "failures": failures}, ensure_ascii=False, indent=2) + "\n")
-        return 1
-
-    sys.stdout.write(json.dumps({"success": True, "count": len(cases)}, ensure_ascii=False) + "\n")
-    return 0
+    output = {
+        "success": summary["success"],
+        "total": summary["total"],
+        "passed": summary["passed"],
+        "failed": summary["failed"],
+        "pass_rate": summary["pass_rate"],
+        "thresholds": summary["thresholds"],
+        "failures": summary["failures"],
+    }
+    sys.stdout.write(json.dumps(output, ensure_ascii=False, indent=2) + "\n")
+    return 0 if summary["success"] else 1
 
 
 if __name__ == "__main__":

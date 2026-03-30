@@ -95,6 +95,8 @@ services:
       dockerfile: Dockerfile
     container_name: smatrix-frontend
     restart: always
+    environment:
+      - SMATRIX_API_KEY=${SMATRIX_API_KEY}
     ports:
       - "35173:80"
     networks:

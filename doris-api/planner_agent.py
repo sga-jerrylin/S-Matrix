@@ -33,7 +33,7 @@ class PlannerAgent:
                 scored_tables.append((score, index, table_name))
 
         scored_tables.sort(key=lambda item: (-item[0], item[1]))
-        tables = [table_name for _, _, table_name in scored_tables[:3]]
+        tables = self._select_tables(scored_tables, normalized_question)
         if not tables and self.tables_context:
             fallback_table = self.tables_context[0].get("table_name")
             tables = [fallback_table] if fallback_table else []
@@ -47,6 +47,36 @@ class PlannerAgent:
             "subtasks": subtasks,
             "needs_join": len(resolved_tables) > 1,
         }
+
+    def _select_tables(self, scored_tables: List[tuple[int, int, str]], question: str) -> List[str]:
+        if not scored_tables:
+            return []
+
+        if len(scored_tables) == 1:
+            return [scored_tables[0][2]]
+
+        if not self._has_multi_table_signal(question):
+            return [scored_tables[0][2]]
+
+        return [table_name for _, _, table_name in scored_tables[:3]]
+
+    def _has_multi_table_signal(self, question: str) -> bool:
+        multi_table_keywords = [
+            "join",
+            "关联",
+            "关系",
+            "对应",
+            "连接",
+            "匹配",
+            "参加",
+            "分支",
+            "网点",
+            "以及",
+        ]
+        if any(keyword in question for keyword in multi_table_keywords):
+            return True
+
+        return "和" in question or "与" in question or "及" in question
 
     def _build_haystack(self, table: Dict[str, Any]) -> str:
         parts = [

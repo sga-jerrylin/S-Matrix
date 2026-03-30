@@ -4,6 +4,7 @@ Excel 上传处理器
 import pandas as pd
 import requests
 import asyncio
+import re
 from typing import Dict, Any, List
 from io import BytesIO
 from config import (
@@ -23,6 +24,32 @@ class ExcelUploadHandler:
     def __init__(self):
         self.db = doris_client
         self.stream_load_config = DORIS_STREAM_LOAD
+
+    def _normalize_identifier(self, identifier: str, prefix: str = "col") -> str:
+        normalized = str(identifier or "").strip()
+        normalized = normalized.replace(" ", "_").replace("-", "_")
+        normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "_", normalized)
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+
+        if not normalized:
+            normalized = prefix
+        if normalized[0].isdigit():
+            normalized = f"{prefix}_{normalized}"
+        return normalized
+
+    def _normalize_identifier_list(self, identifiers: List[str], prefix: str = "col") -> List[str]:
+        counters: Dict[str, int] = {}
+        normalized_list: List[str] = []
+
+        for identifier in identifiers:
+            base_name = self._normalize_identifier(str(identifier), prefix)
+            counters[base_name] = counters.get(base_name, 0) + 1
+            if counters[base_name] == 1:
+                normalized_list.append(base_name)
+            else:
+                normalized_list.append(f"{base_name}_{counters[base_name]}")
+
+        return normalized_list
     
     def preview_excel(self, file_content: bytes, rows: int = 10) -> Dict[str, Any]:
         """
@@ -92,19 +119,15 @@ class ExcelUploadHandler:
             key_columns = [list(columns.keys())[0]]
         
         # 校验表名
-        safe_table_name = self.db.validate_identifier(table_name)
+        normalized_table_name = self._normalize_identifier(table_name, "table")
+        safe_table_name = self.db.validate_identifier(normalized_table_name)
 
         # 构造列定义
         column_defs = []
         for col_name, col_type in columns.items():
-            # 处理列名中的特殊字符，校验列名
-            safe_col_name_raw = col_name.replace(' ', '_').replace('-', '_')
+            # 清洗列名中的特殊字符，确保 Doris 标识符安全
+            safe_col_name_raw = self._normalize_identifier(col_name, "col")
             safe_col_name = self.db.validate_identifier(safe_col_name_raw)
-            # validate_identifier 返回带反引号的字符串，如 `id`
-            # 但这里我们可能需要裸字符串拼接 SQL 还是怎样？
-            # validate_identifier 返回 "`id`"
-            # 我们的 SQL 模板是 `{column_defs_str}`
-            # column_defs.append(f"{safe_col_name} {col_type}") 即可
             column_defs.append(f"{safe_col_name} {col_type}")
         
         column_defs_str = ',\n    '.join(column_defs)
@@ -112,7 +135,7 @@ class ExcelUploadHandler:
         # 处理 key_columns
         safe_keys = []
         for k in key_columns:
-             safe_k_raw = k.replace(' ', '_').replace('-', '_')
+             safe_k_raw = self._normalize_identifier(k, "col")
              safe_keys.append(self.db.validate_identifier(safe_k_raw))
              
         key_columns_str = ', '.join(safe_keys)
@@ -136,10 +159,15 @@ class ExcelUploadHandler:
         """异步创建表"""
         return await asyncio.to_thread(self.create_table, table_name, columns, key_columns)
     
-    def import_excel(self, file_content: bytes, table_name: str, 
-                     column_mapping: Dict[str, str] = None,
-                     create_table_if_not_exists: bool = True,
-                     column_types: Dict[str, str] = None) -> Dict[str, Any]:
+    def import_excel(
+        self,
+        file_content: bytes,
+        table_name: str,
+        column_mapping: Dict[str, str] = None,
+        create_table_if_not_exists: bool = True,
+        column_types: Dict[str, str] = None,
+        import_mode: str = "replace",
+    ) -> Dict[str, Any]:
         """
         导入 Excel 到 Doris
         
@@ -155,6 +183,10 @@ class ExcelUploadHandler:
         """
         import numpy as np
 
+        normalized_import_mode = (import_mode or "replace").strip().lower()
+        if normalized_import_mode not in {"replace", "append"}:
+            raise ValueError("import_mode must be one of: replace, append")
+
         # 读取 Excel
         df = pd.read_excel(BytesIO(file_content))
         if len(df.columns) > DORIS_MAX_COLUMNS:
@@ -164,12 +196,14 @@ class ExcelUploadHandler:
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.fillna('')
 
+        normalized_table_name = self._normalize_identifier(table_name, "table")
+
         # 应用列映射
         if column_mapping:
             df = df.rename(columns=column_mapping)
 
         # 清理列名
-        df.columns = [col.replace(' ', '_').replace('-', '_') for col in df.columns]
+        df.columns = self._normalize_identifier_list([str(col) for col in df.columns], "col")
 
         # 清理数据:移除字段中的换行符和制表符,避免 CSV 解析错误
         for col in df.columns:
@@ -179,11 +213,14 @@ class ExcelUploadHandler:
                 df[col] = df[col].str.replace('\t', ' ', regex=False)
 
         # 检查表是否存在
-        table_exists = self.db.table_exists(table_name)
+        table_exists = self.db.table_exists(normalized_table_name)
+
+        table_existed = table_exists
+        table_replaced = False
 
         if not table_exists:
             if not create_table_if_not_exists:
-                raise ValueError(f"Table '{table_name}' does not exist")
+                raise ValueError(f"Table '{normalized_table_name}' does not exist")
 
             # 自动推断列类型
             if not column_types:
@@ -200,14 +237,12 @@ class ExcelUploadHandler:
                         column_types[col] = 'VARCHAR(500)'
 
             # 创建表
-            create_sql = self.create_table(table_name, column_types)
+            create_sql = self.create_table(normalized_table_name, column_types)
         else:
-            # 表已存在,检查列数是否匹配
-            existing_schema = self.db.get_table_schema(table_name)
-
-            if len(existing_schema) != len(df.columns):
-                # 列数不匹配,删除旧表并重新创建
-                self.db.execute_update(f"DROP TABLE `{table_name}`")
+            # Excel 默认使用 replace，避免用户重复上传时静默追加脏数据。
+            existing_schema = self.db.get_table_schema(normalized_table_name)
+            if normalized_import_mode == "replace":
+                self.db.execute_update(f"DROP TABLE `{normalized_table_name}`")
 
                 # 自动推断列类型
                 column_types = {}
@@ -223,17 +258,29 @@ class ExcelUploadHandler:
                         column_types[col] = 'VARCHAR(500)'
 
                 # 重新创建表
-                create_sql = self.create_table(table_name, column_types)
+                create_sql = self.create_table(normalized_table_name, column_types)
                 table_exists = False
+                table_replaced = True
+            else:
+                existing_fields = [column.get("Field") for column in existing_schema]
+                incoming_fields = list(df.columns)
+                if existing_fields != incoming_fields:
+                    raise ValueError(
+                        "Append mode requires matching column order and names between existing table and uploaded file"
+                    )
         
         # 使用 Stream Load 导入数据
-        result = self.stream_load(df, table_name)
+        result = self.stream_load(df, normalized_table_name)
         
         return {
             'success': True,
-            'table': table_name,
+            'table': normalized_table_name,
+            'requested_table_name': table_name,
             'rows_imported': len(df),
+            'table_existed': table_existed,
             'table_created': not table_exists,
+            'table_replaced': table_replaced,
+            'import_mode': normalized_import_mode,
             'stream_load_result': result
         }
     
@@ -364,14 +411,24 @@ class ExcelUploadHandler:
         """异步执行 Stream Load"""
         return await asyncio.to_thread(self.stream_load, df, table_name)
     
-    async def import_excel_async(self, file_content: bytes, table_name: str, 
-                     column_mapping: Dict[str, str] = None,
-                     create_table_if_not_exists: bool = True,
-                     column_types: Dict[str, str] = None) -> Dict[str, Any]:
+    async def import_excel_async(
+        self,
+        file_content: bytes,
+        table_name: str,
+        column_mapping: Dict[str, str] = None,
+        create_table_if_not_exists: bool = True,
+        column_types: Dict[str, str] = None,
+        import_mode: str = "replace",
+    ) -> Dict[str, Any]:
         """异步导入 Excel"""
         return await asyncio.to_thread(
-            self.import_excel, file_content, table_name, column_mapping, 
-            create_table_if_not_exists, column_types
+            self.import_excel,
+            file_content,
+            table_name,
+            column_mapping,
+            create_table_if_not_exists,
+            column_types,
+            import_mode,
         )
 
 # 全局实例

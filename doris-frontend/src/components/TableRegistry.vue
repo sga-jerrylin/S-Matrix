@@ -39,7 +39,24 @@
             <a-tag v-else>未知</a-tag>
           </template>
           <template v-else-if="column.key === 'actions'">
-            <a-button type="link" size="small" @click="openEdit(record)">编辑</a-button>
+            <a-space size="small">
+              <a-button type="link" size="small" @click="openEdit(record)">编辑</a-button>
+              <a-popconfirm
+                title="删除后会清理物理表、元数据、Agent 配置和相关关系，是否继续？"
+                ok-text="删除"
+                cancel-text="取消"
+                @confirm="deleteTable(record)"
+              >
+                <a-button
+                  type="link"
+                  danger
+                  size="small"
+                  :loading="deletingTableName === record.table_name"
+                >
+                  删除
+                </a-button>
+              </a-popconfirm>
+            </a-space>
           </template>
         </template>
       </a-table>
@@ -74,9 +91,11 @@ import { ref, computed, onMounted } from 'vue';
 import { message } from 'ant-design-vue';
 import { InfoCircleOutlined } from '@ant-design/icons-vue';
 import { dorisApi } from '../api/doris';
+import { extractApiErrorMessage } from '../api/errors';
 
 const loading = ref(false);
 const saving = ref(false);
+const deletingTableName = ref('');
 const tables = ref<any[]>([]);
 const searchText = ref('');
 
@@ -94,7 +113,7 @@ const columns = [
   { title: '描述', dataIndex: 'description', key: 'description', ellipsis: true },
   { title: '来源', dataIndex: 'source_type', key: 'source_type', width: 120 },
   { title: '分析时间', dataIndex: 'analyzed_at', key: 'analyzed_at', width: 180 },
-  { title: '操作', key: 'actions', width: 80 },
+  { title: '操作', key: 'actions', width: 140 },
 ];
 
 const filteredTables = computed(() => {
@@ -113,7 +132,7 @@ const loadRegistry = async () => {
     const response = await dorisApi.tableRegistry.list();
     tables.value = response.data.tables || [];
   } catch (error: any) {
-    message.error('加载同步表失败: ' + (error.response?.data?.detail || error.message));
+    message.error('加载同步表失败: ' + extractApiErrorMessage(error));
   } finally {
     loading.value = false;
   }
@@ -141,9 +160,28 @@ const saveEdit = async () => {
     editVisible.value = false;
     await loadRegistry();
   } catch (error: any) {
-    message.error('更新失败: ' + (error.response?.data?.detail || error.message));
+    message.error('更新失败: ' + extractApiErrorMessage(error));
   } finally {
     saving.value = false;
+  }
+};
+
+const deleteTable = async (record: any) => {
+  const tableName = record?.table_name;
+  if (!tableName) return;
+
+  deletingTableName.value = tableName;
+  try {
+    await dorisApi.tableRegistry.delete(tableName, {
+      dropPhysical: true,
+      cleanupHistory: true,
+    });
+    message.success(`已删除表 ${tableName}`);
+    await loadRegistry();
+  } catch (error: any) {
+    message.error('删除失败: ' + extractApiErrorMessage(error));
+  } finally {
+    deletingTableName.value = '';
   }
 };
 

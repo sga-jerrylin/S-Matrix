@@ -22,6 +22,16 @@
           <a-input v-model:value="formState.tableName" placeholder="输入表名" />
         </a-form-item>
 
+        <a-form-item label="导入方式" required>
+          <a-radio-group v-model:value="formState.importMode">
+            <a-radio-button value="replace">覆盖现有表</a-radio-button>
+            <a-radio-button value="append">追加到现有表</a-radio-button>
+          </a-radio-group>
+          <div class="form-hint">
+            覆盖会重建同名表；追加要求上传文件与现有表的列名和顺序完全一致。
+          </div>
+        </a-form-item>
+
         <a-form-item>
           <a-checkbox v-model:checked="formState.createTable">
             如果表不存在则自动创建
@@ -73,7 +83,8 @@
 import { ref, computed } from 'vue';
 import { message } from 'ant-design-vue';
 import { InboxOutlined } from '@ant-design/icons-vue';
-import { dorisApi } from '../api/doris';
+import { dorisApi, type UploadImportMode } from '../api/doris';
+import { extractApiErrorMessage } from '../api/errors';
 
 const fileList = ref([]);
 const currentFile = ref<File | null>(null);
@@ -83,6 +94,7 @@ const previewData = ref<any>(null);
 
 const formState = ref({
   tableName: '',
+  importMode: 'replace' as UploadImportMode,
   createTable: true,
 });
 
@@ -120,7 +132,7 @@ const handlePreview = async () => {
     previewData.value = response.data;
     message.success('预览成功');
   } catch (error: any) {
-    message.error('预览失败: ' + (error.response?.data?.detail?.error || error.message));
+    message.error('预览失败: ' + extractApiErrorMessage(error));
   } finally {
     previewLoading.value = false;
   }
@@ -143,16 +155,19 @@ const handleUpload = async () => {
       currentFile.value,
       formState.value.tableName,
       undefined,
-      formState.value.createTable
+      formState.value.createTable,
+      formState.value.importMode,
     );
-    message.success(`成功导入 ${response.data.rows_imported} 行数据到表 ${response.data.table}`);
+    const actionLabel = response.data.table_replaced ? '覆盖导入' : '导入';
+    message.success(`成功${actionLabel} ${response.data.rows_imported} 行数据到表 ${response.data.table}`);
     
     fileList.value = [];
     currentFile.value = null;
     previewData.value = null;
     formState.value.tableName = '';
+    formState.value.importMode = 'replace';
   } catch (error: any) {
-    message.error('上传失败: ' + (error.response?.data?.detail?.error || error.message));
+    message.error('上传失败: ' + extractApiErrorMessage(error));
   } finally {
     uploadLoading.value = false;
   }
@@ -163,5 +178,10 @@ const handleUpload = async () => {
 .excel-upload {
   padding: 24px;
 }
-</style>
 
+.form-hint {
+  margin-top: 8px;
+  color: #999;
+  font-size: 12px;
+}
+</style>
