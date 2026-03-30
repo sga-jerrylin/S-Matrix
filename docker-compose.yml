@@ -85,8 +85,7 @@ services:
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       - SMATRIX_API_KEY=${SMATRIX_API_KEY}
       - SMATRIX_CORS_ORIGINS=${SMATRIX_CORS_ORIGINS:-http://localhost:35173}
-      # 固定加密密钥，确保密码加密一致
-      - ENCRYPTION_KEY=***REDACTED-ENCRYPTION-KEY***=
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
 
   # Frontend Web UI
   smatrix-frontend:

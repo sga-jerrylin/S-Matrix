@@ -155,7 +155,25 @@ const saveGatewayKey = async () => {
   window.location.reload();
 };
 
-onMounted(() => {
+const autoInitApiKey = async () => {
+  // 已有 key（localStorage 或 env）则跳过
+  const existing = resolveGatewayApiKey({ envApiKey: import.meta.env.VITE_SMATRIX_API_KEY });
+  if (existing) return;
+
+  try {
+    const res = await fetch('/api/config');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.api_key) {
+      setStoredGatewayApiKey(data.api_key);
+    }
+  } catch {
+    // 静默失败，不影响页面加载
+  }
+};
+
+onMounted(async () => {
+  await autoInitApiKey();
   checkHealth();
   setInterval(checkHealth, 30000);
 });

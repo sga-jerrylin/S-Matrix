@@ -238,7 +238,8 @@ async def startup_event():
 
 @app.middleware("http")
 async def api_guard_middleware(request: Request, call_next):
-    if request.url.path.startswith("/api") and request.url.path != "/api/health":
+    _no_auth_paths = {"/api/health", "/api/config"}
+    if request.url.path.startswith("/api") and request.url.path not in _no_auth_paths:
         expected_api_key = os.getenv("SMATRIX_API_KEY")
         if not expected_api_key:
             return JSONResponse(
@@ -373,6 +374,19 @@ async def health_check():
             "doris_connected": False,
             "error": str(e)
         }
+
+
+@app.get("/api/config")
+async def get_client_config():
+    """
+    返回前端初始化所需的公开配置（无需认证）。
+    仅在同一内网/Docker 网络内可访问，不对公网暴露。
+    """
+    api_key = os.getenv("SMATRIX_API_KEY", "")
+    return {
+        "api_key": api_key,
+        "has_api_key": bool(api_key),
+    }
 
 
 @app.post("/api/execute")
