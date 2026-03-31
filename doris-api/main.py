@@ -398,15 +398,15 @@ class LLMConfigRequest(BaseModel):
 
 
 class AnalysisTableRequest(BaseModel):
-    depth: str = Field(default=ANALYST_DEFAULT_DEPTH, description="Analysis depth: quick/standard/deep")
+    depth: str = Field(default=ANALYST_DEFAULT_DEPTH, description="Analysis depth: quick/standard/deep/expert")
     resource_name: Optional[str] = Field(default=None, description="Optional LLM resource name")
 
     @field_validator("depth")
     @classmethod
     def validate_depth(cls, value: str) -> str:
         normalized = (value or "").strip().lower()
-        if normalized not in {"quick", "standard", "deep"}:
-            raise ValueError("depth must be one of quick, standard, deep")
+        if normalized not in {"quick", "standard", "deep", "expert"}:
+            raise ValueError("depth must be one of quick, standard, deep, expert")
         return normalized
 
 
@@ -423,7 +423,7 @@ def _require_analyst_agent() -> AnalystAgent:
 class AnalysisScheduleCreateRequest(BaseModel):
     name: str = Field(..., description="Schedule name")
     tables: List[str] = Field(..., description="One or more table names")
-    depth: str = Field(default=ANALYST_DEFAULT_DEPTH, description="Analysis depth: quick/standard/deep")
+    depth: str = Field(default=ANALYST_DEFAULT_DEPTH, description="Analysis depth: quick/standard/deep/expert")
     resource_name: Optional[str] = Field(default=None, description="Optional LLM resource name")
     schedule_type: str = Field(..., description="Schedule type: hourly/daily/weekly/monthly")
     schedule_hour: int = Field(default=8, description="Hour (0-23)")
@@ -438,8 +438,8 @@ class AnalysisScheduleCreateRequest(BaseModel):
     @classmethod
     def validate_schedule_depth(cls, value: str) -> str:
         normalized = (value or "").strip().lower()
-        if normalized not in {"quick", "standard", "deep"}:
-            raise ValueError("depth must be one of quick, standard, deep")
+        if normalized not in {"quick", "standard", "deep", "expert"}:
+            raise ValueError("depth must be one of quick, standard, deep, expert")
         return normalized
 
     @field_validator("schedule_type")
@@ -460,7 +460,7 @@ class AnalysisScheduleCreateRequest(BaseModel):
 class AnalysisScheduleUpdateRequest(BaseModel):
     name: Optional[str] = Field(default=None, description="Schedule name")
     tables: Optional[List[str]] = Field(default=None, description="One or more table names")
-    depth: Optional[str] = Field(default=None, description="Analysis depth: quick/standard/deep")
+    depth: Optional[str] = Field(default=None, description="Analysis depth: quick/standard/deep/expert")
     resource_name: Optional[str] = Field(default=None, description="Optional LLM resource name")
     schedule_type: Optional[str] = Field(default=None, description="Schedule type: hourly/daily/weekly/monthly")
     schedule_hour: Optional[int] = Field(default=None, description="Hour (0-23)")
@@ -477,8 +477,8 @@ class AnalysisScheduleUpdateRequest(BaseModel):
         if value is None:
             return value
         normalized = value.strip().lower()
-        if normalized not in {"quick", "standard", "deep"}:
-            raise ValueError("depth must be one of quick, standard, deep")
+        if normalized not in {"quick", "standard", "deep", "expert"}:
+            raise ValueError("depth must be one of quick, standard, deep, expert")
         return normalized
 
     @field_validator("schedule_type")
@@ -1045,10 +1045,10 @@ async def analysis_reports(table_names: Optional[str] = None, limit: int = 20, o
 
 
 @app.get("/api/analysis/reports/latest/{table_name}")
-async def latest_analysis_report(table_name: str):
+async def latest_analysis_report(table_name: str, include_reasoning: bool = False):
     agent = _require_analyst_agent()
     try:
-        return await asyncio.to_thread(agent.get_latest_report, table_name)
+        return await asyncio.to_thread(agent.get_latest_report, table_name, include_reasoning)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except HTTPException:
@@ -1058,10 +1058,10 @@ async def latest_analysis_report(table_name: str):
 
 
 @app.get("/api/analysis/reports/{report_id}")
-async def analysis_report_detail(report_id: str):
+async def analysis_report_detail(report_id: str, include_reasoning: bool = False):
     agent = _require_analyst_agent()
     try:
-        return await asyncio.to_thread(agent.get_report, report_id)
+        return await asyncio.to_thread(agent.get_report, report_id, include_reasoning)
     except HTTPException:
         raise
     except Exception as exc:

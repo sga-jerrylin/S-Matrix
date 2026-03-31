@@ -43,17 +43,37 @@ class FakeAnalystAgent:
             "offset": offset,
         }
 
-    def get_report(self, report_id):
-        self.calls.append(("get_report", report_id))
-        return {"success": True, "id": report_id, "table_names": "sales"}
+    def get_report(self, report_id, include_reasoning=False):
+        self.calls.append(("get_report", report_id, include_reasoning))
+        payload = {"success": True, "id": report_id, "table_names": "sales"}
+        if include_reasoning:
+            payload["reasoning_traces"] = [{"round": 1, "trace": "details"}]
+        return payload
 
     def delete_report(self, report_id):
         self.calls.append(("delete_report", report_id))
         return {"success": True, "deleted": True, "id": report_id}
 
-    def get_latest_report(self, table_name):
-        self.calls.append(("get_latest_report", table_name))
-        return {"success": True, "id": "latest-1", "table_names": table_name}
+    def get_latest_report(self, table_name, include_reasoning=False):
+        self.calls.append(("get_latest_report", table_name, include_reasoning))
+        payload = {"success": True, "id": "latest-1", "table_names": table_name}
+        if include_reasoning:
+            payload["reasoning_traces"] = [{"round": 1, "trace": "details"}]
+        return payload
+
+    def get_report_with_reasoning(self, report_id, include_reasoning=False):
+        self.calls.append(("get_report_with_reasoning", report_id, include_reasoning))
+        payload = {"success": True, "id": report_id, "table_names": "sales"}
+        if include_reasoning:
+            payload["reasoning_traces"] = [{"round": 1, "trace": "details"}]
+        return payload
+
+    def get_latest_report_with_reasoning(self, table_name, include_reasoning=False):
+        self.calls.append(("get_latest_report_with_reasoning", table_name, include_reasoning))
+        payload = {"success": True, "id": "latest-1", "table_names": table_name}
+        if include_reasoning:
+            payload["reasoning_traces"] = [{"round": 1, "trace": "details"}]
+        return payload
 
 
 class FakeAnalysisScheduler:
@@ -195,8 +215,24 @@ def test_analysis_report_detail_endpoint(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert main.analyst_agent.calls[0] == ("get_report", "report-1")
+    assert main.analyst_agent.calls[0] == ("get_report", "report-1", False)
     assert response.json()["id"] == "report-1"
+
+
+def test_analysis_report_detail_include_reasoning(monkeypatch):
+    main = reload_main()
+    monkeypatch.setenv("SMATRIX_API_KEY", "secret-key")
+
+    main.analyst_agent = FakeAnalystAgent()
+    client = TestClient(main.app)
+    response = client.get(
+        "/api/analysis/reports/report-1?include_reasoning=true",
+        headers={"X-API-Key": "secret-key"},
+    )
+
+    assert response.status_code == 200
+    assert main.analyst_agent.calls[0] == ("get_report", "report-1", True)
+    assert response.json()["reasoning_traces"][0]["trace"] == "details"
 
 
 def test_analysis_report_delete_endpoint(monkeypatch):
@@ -227,8 +263,24 @@ def test_analysis_latest_report_endpoint(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert main.analyst_agent.calls[0] == ("get_latest_report", "sales")
+    assert main.analyst_agent.calls[0] == ("get_latest_report", "sales", False)
     assert response.json()["id"] == "latest-1"
+
+
+def test_analysis_latest_report_include_reasoning(monkeypatch):
+    main = reload_main()
+    monkeypatch.setenv("SMATRIX_API_KEY", "secret-key")
+
+    main.analyst_agent = FakeAnalystAgent()
+    client = TestClient(main.app)
+    response = client.get(
+        "/api/analysis/reports/latest/sales?include_reasoning=true",
+        headers={"X-API-Key": "secret-key"},
+    )
+
+    assert response.status_code == 200
+    assert main.analyst_agent.calls[0] == ("get_latest_report", "sales", True)
+    assert response.json()["reasoning_traces"][0]["trace"] == "details"
 
 
 def test_analysis_schedule_create_endpoint(monkeypatch):
@@ -286,6 +338,22 @@ def test_analysis_schedule_update_endpoint(monkeypatch):
     assert response.status_code == 200
     assert main.analysis_scheduler.calls[0][0] == "update_schedule"
     assert response.json()["schedule"]["name"] == "Updated sales"
+
+
+def test_analysis_schedule_update_endpoint_accepts_expert_depth(monkeypatch):
+    main = reload_main()
+    monkeypatch.setenv("SMATRIX_API_KEY", "secret-key")
+    main.analysis_scheduler = FakeAnalysisScheduler()
+
+    client = TestClient(main.app)
+    response = client.put(
+        "/api/analysis/schedules/schedule-1",
+        headers={"X-API-Key": "secret-key", "Content-Type": "application/json"},
+        json={"depth": "expert"},
+    )
+
+    assert response.status_code == 200
+    assert main.analysis_scheduler.calls[0] == ("update_schedule", "schedule-1", {"depth": "expert"})
 
 
 def test_analysis_schedule_delete_endpoint(monkeypatch):

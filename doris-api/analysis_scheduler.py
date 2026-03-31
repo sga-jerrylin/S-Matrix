@@ -40,6 +40,7 @@ class AnalysisScheduler:
         self.dispatcher = dispatcher
         self.event_loop = None
         self._run_lock = threading.Lock()
+        self._running_schedule_ids: set[str] = set()
 
         key = os.getenv("ENCRYPTION_KEY")
         if key:
@@ -239,43 +240,57 @@ class AnalysisScheduler:
 
     def _execute_schedule_row(self, row: Dict[str, Any], now_utc: Optional[datetime] = None) -> Dict[str, Any]:
         schedule = self._deserialize_row(row, redact=False)
+        if schedule["depth"] == "expert" and schedule["id"] in self._running_schedule_ids:
+            logger.info("skipping expert analysis schedule %s because a prior run is still active", schedule["id"])
+            return {
+                "success": False,
+                "skipped": True,
+                "reason": "already_running",
+                "schedule": self._deserialize_row(row, redact=True),
+            }
+
         now_utc = now_utc or datetime.now(timezone.utc)
         reports = []
+        if schedule["depth"] == "expert":
+            self._running_schedule_ids.add(schedule["id"])
 
-        for table_name in schedule["tables"]:
-            report = self.agent.analyze_table(
-                table_name,
-                schedule["depth"],
-                schedule.get("resource_name"),
-                trigger_type="scheduled_analysis",
-                schedule_id=schedule["id"],
+        try:
+            for table_name in schedule["tables"]:
+                report = self.agent.analyze_table(
+                    table_name,
+                    schedule["depth"],
+                    schedule.get("resource_name"),
+                    trigger_type="scheduled_analysis",
+                    schedule_id=schedule["id"],
+                )
+                reports.append(report)
+                if schedule.get("delivery"):
+                    self._dispatch_report(report, schedule["delivery"])
+
+            last_run_at = self._format_utc(now_utc)
+            next_run_at = self._compute_next_run(schedule, now_utc=now_utc)
+            self.db.execute_update(
+                """
+                UPDATE `_sys_analysis_schedules`
+                SET `last_run_at` = %s,
+                    `next_run_at` = %s,
+                    `updated_at` = %s
+                WHERE `id` = %s
+                """,
+                (last_run_at, next_run_at, self._format_utc(datetime.now(timezone.utc)), schedule["id"]),
             )
-            reports.append(report)
-            if schedule.get("delivery"):
-                self._dispatch_report(report, schedule["delivery"])
+            row["last_run_at"] = last_run_at
+            row["next_run_at"] = next_run_at
+            row["updated_at"] = self._format_utc(datetime.now(timezone.utc))
 
-        last_run_at = self._format_utc(now_utc)
-        next_run_at = self._compute_next_run(schedule, now_utc=now_utc)
-        self.db.execute_update(
-            """
-            UPDATE `_sys_analysis_schedules`
-            SET `last_run_at` = %s,
-                `next_run_at` = %s,
-                `updated_at` = %s
-            WHERE `id` = %s
-            """,
-            (last_run_at, next_run_at, self._format_utc(datetime.now(timezone.utc)), schedule["id"]),
-        )
-        row["last_run_at"] = last_run_at
-        row["next_run_at"] = next_run_at
-        row["updated_at"] = self._format_utc(datetime.now(timezone.utc))
-
-        return {
-            "success": True,
-            "schedule": self._deserialize_row(row, redact=True),
-            "count": len(reports),
-            "reports": reports,
-        }
+            return {
+                "success": True,
+                "schedule": self._deserialize_row(row, redact=True),
+                "count": len(reports),
+                "reports": reports,
+            }
+        finally:
+            self._running_schedule_ids.discard(schedule["id"])
 
     def _dispatch_report(self, report: Dict[str, Any], delivery_config: Dict[str, Any] | None) -> None:
         channels = (delivery_config or {}).get("channels") or []
@@ -362,8 +377,8 @@ class AnalysisScheduler:
             self.db.validate_identifier(table_name)
 
         depth = (config.get("depth") or "standard").strip().lower()
-        if depth not in {"quick", "standard", "deep"}:
-            raise ValueError("depth must be one of quick, standard, deep")
+        if depth not in {"quick", "standard", "deep", "expert"}:
+            raise ValueError("depth must be one of quick, standard, deep, expert")
 
         schedule_type = (config.get("schedule_type") or "").strip().lower()
         if schedule_type not in _SUPPORTED_SCHEDULE_TYPES:

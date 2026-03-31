@@ -103,6 +103,7 @@
                     <a-radio-button value="quick">Quick</a-radio-button>
                     <a-radio-button value="standard">Standard</a-radio-button>
                     <a-radio-button value="deep">Deep</a-radio-button>
+                    <a-radio-button value="expert">Expert</a-radio-button>
                   </a-radio-group>
                 </a-form-item>
               </a-col>
@@ -125,6 +126,14 @@
             </a-form-item>
           </a-form>
 
+          <a-alert
+            v-if="analysisForm.depth === 'expert'"
+            class="expert-mode-note"
+            type="info"
+            show-icon
+            message="Expert 模式通常需要 2-5 分钟，并会生成 conversation 与 reasoning 细节。"
+          />
+
           <a-empty v-if="!analysisResult" description="选择表后运行分析，结果会显示在这里" />
 
           <a-card v-else size="small" class="analysis-result">
@@ -135,6 +144,17 @@
               </a-space>
             </template>
             <p class="report-summary">{{ analysisResult.summary || '暂无摘要' }}</p>
+            <a-space
+              v-if="analysisResult.depth === 'expert'"
+              wrap
+              class="report-metrics"
+              style="margin-bottom: 12px"
+            >
+              <a-tag :color="confidenceColor(analysisResult.confidence_ratings?.overall)">
+                {{ formatConfidence(analysisResult.confidence_ratings?.overall) }}
+              </a-tag>
+              <a-tag color="blue">Expert</a-tag>
+            </a-space>
 
             <a-divider orientation="left">洞察</a-divider>
             <a-empty v-if="!(analysisResult.insights || []).length" description="暂无洞察" />
@@ -149,9 +169,68 @@
               </template>
             </a-list>
 
+            <template v-if="analysisResult.depth === 'expert'">
+              <a-divider orientation="left">Root Causes</a-divider>
+              <a-empty v-if="!(analysisResult.root_causes || []).length" description="暂无根因分析" />
+              <a-list v-else :data-source="analysisResult.root_causes" size="small" bordered />
+
+              <a-divider orientation="left">Evidence Chains</a-divider>
+              <a-empty v-if="!(analysisResult.evidence_chains || []).length" description="暂无证据链" />
+              <a-list v-else :data-source="analysisResult.evidence_chains" size="small">
+                <template #renderItem="{ item }">
+                  <a-list-item>
+                    <div class="evidence-card">
+                      <strong>{{ item.finding || 'Finding' }}</strong>
+                      <div class="inline-metric">Hypotheses: {{ (item.hypotheses || []).length }}</div>
+                      <div class="inline-metric">Assessments: {{ (item.assessments || []).length }}</div>
+                      <div class="inline-metric">Follow-ups: {{ (item.follow_ups || []).length }}</div>
+                    </div>
+                  </a-list-item>
+                </template>
+              </a-list>
+
+              <a-divider orientation="left">Conversation Timeline</a-divider>
+              <a-empty v-if="!(analysisResult.conversation_chain || []).length" description="暂无 conversation" />
+              <a-collapse v-else>
+                <a-collapse-panel
+                  v-for="(round, index) in analysisResult.conversation_chain || []"
+                  :key="round.round || index"
+                  :header="`Round ${round.round || index + 1}`"
+                >
+                  <pre class="sql-preview">{{ formatJson(round.strategist_output || {}) }}</pre>
+                  <div class="round-result-list" v-if="(round.results || []).length">
+                    <div v-for="(result, resultIndex) in round.results || []" :key="result.title || resultIndex" class="evidence-card">
+                      <strong>{{ result.title || `Query ${resultIndex + 1}` }}</strong>
+                      <div class="inline-metric">Rows: {{ result.row_count ?? 0 }}</div>
+                      <div class="inline-metric">Status: {{ result.success ? 'success' : 'failed' }}</div>
+                      <div class="inline-metric" v-if="result.error_message">Error: {{ result.error_message }}</div>
+                    </div>
+                  </div>
+                </a-collapse-panel>
+              </a-collapse>
+
+              <a-divider orientation="left">Reasoning Trace</a-divider>
+              <a-empty v-if="!(analysisResult.reasoning_traces || []).length" description="暂无 reasoning" />
+              <a-collapse v-else ghost>
+                <a-collapse-panel
+                  v-for="(trace, index) in analysisResult.reasoning_traces || []"
+                  :key="trace.round || index"
+                  :header="`Round ${trace.round || index + 1}`"
+                >
+                  <pre class="reasoning-preview">{{ trace.trace || '-' }}</pre>
+                </a-collapse-panel>
+              </a-collapse>
+            </template>
+
             <a-divider orientation="left">建议</a-divider>
             <a-empty v-if="!(analysisResult.recommendations || []).length" description="暂无建议" />
             <a-list v-else :data-source="analysisResult.recommendations" size="small" bordered />
+
+            <template v-if="analysisResult.depth === 'expert'">
+              <a-divider orientation="left">Limitations</a-divider>
+              <a-empty v-if="!(analysisResult.limitations || []).length" description="暂无限制说明" />
+              <a-list v-else :data-source="analysisResult.limitations" size="small" bordered />
+            </template>
           </a-card>
         </a-tab-pane>
 
@@ -224,6 +303,17 @@
           <span>{{ selectedReport.created_at || '-' }}</span>
         </a-space>
         <p class="report-summary">{{ selectedReport.summary || '暂无摘要' }}</p>
+        <a-space
+          v-if="selectedReport.depth === 'expert'"
+          wrap
+          class="report-metrics"
+          style="margin-bottom: 12px"
+        >
+          <a-tag :color="confidenceColor(selectedReport.confidence_ratings?.overall)">
+            {{ formatConfidence(selectedReport.confidence_ratings?.overall) }}
+          </a-tag>
+          <a-tag color="blue">Expert</a-tag>
+        </a-space>
 
         <a-divider orientation="left">洞察</a-divider>
         <a-list :data-source="selectedReport.insights || []" size="small" bordered>
@@ -236,6 +326,59 @@
             </a-list-item>
           </template>
         </a-list>
+
+        <template v-if="selectedReport.depth === 'expert'">
+          <a-divider orientation="left">Evidence Chains</a-divider>
+          <a-empty v-if="!(selectedReport.evidence_chains || []).length" description="暂无证据链" />
+          <a-list v-else :data-source="selectedReport.evidence_chains" size="small">
+            <template #renderItem="{ item }">
+              <a-list-item>
+                <div class="evidence-card">
+                  <strong>{{ item.finding || 'Finding' }}</strong>
+                  <div class="inline-metric">Hypotheses: {{ (item.hypotheses || []).length }}</div>
+                  <div class="inline-metric">Assessments: {{ (item.assessments || []).length }}</div>
+                  <div class="inline-metric">Follow-ups: {{ (item.follow_ups || []).length }}</div>
+                </div>
+              </a-list-item>
+            </template>
+          </a-list>
+
+          <a-divider orientation="left">Conversation Timeline</a-divider>
+          <a-empty v-if="!(selectedReport.conversation_chain || []).length" description="暂无 conversation" />
+          <a-collapse v-else>
+            <a-collapse-panel
+              v-for="(round, index) in selectedReport.conversation_chain || []"
+              :key="round.round || index"
+              :header="`Round ${round.round || index + 1}`"
+            >
+              <pre class="sql-preview">{{ formatJson(round.strategist_output || {}) }}</pre>
+              <div class="round-result-list" v-if="(round.results || []).length">
+                <div v-for="(result, resultIndex) in round.results || []" :key="result.title || resultIndex" class="evidence-card">
+                  <strong>{{ result.title || `Query ${resultIndex + 1}` }}</strong>
+                  <div class="inline-metric">Rows: {{ result.row_count ?? 0 }}</div>
+                  <div class="inline-metric">Status: {{ result.success ? 'success' : 'failed' }}</div>
+                  <div class="inline-metric" v-if="result.error_message">Error: {{ result.error_message }}</div>
+                </div>
+              </div>
+            </a-collapse-panel>
+          </a-collapse>
+
+          <a-divider orientation="left">Reasoning Trace</a-divider>
+          <a-empty v-if="!(selectedReport.reasoning_traces || []).length" description="暂无 reasoning" />
+          <a-collapse v-else ghost>
+            <a-collapse-panel
+              v-for="(trace, index) in selectedReport.reasoning_traces || []"
+              :key="trace.round || index"
+              :header="`Round ${trace.round || index + 1}`"
+            >
+              <pre class="reasoning-preview">{{ trace.trace || '-' }}</pre>
+            </a-collapse-panel>
+          </a-collapse>
+
+          <a-divider orientation="left">Limitations</a-divider>
+          <a-empty v-if="!(selectedReport.limitations || []).length" description="暂无限制说明" />
+          <a-list v-else :data-source="selectedReport.limitations" size="small" bordered />
+        </template>
 
         <a-divider orientation="left">步骤</a-divider>
         <a-collapse>
@@ -315,6 +458,13 @@
             <a-form-item label="分析深度">
               <a-select v-model:value="scheduleForm.depth" :options="depthOptions" />
             </a-form-item>
+            <a-alert
+              v-if="scheduleForm.depth === 'expert'"
+              class="expert-mode-note"
+              type="warning"
+              show-icon
+              message="Expert 模式单次计划任务通常需要 2-5 分钟。"
+            />
           </a-col>
           <a-col :xs="24" :md="8">
             <a-form-item label="AI 资源">
@@ -369,6 +519,7 @@
 import { computed, onMounted, ref } from 'vue';
 import { message } from 'ant-design-vue';
 import type {
+  AnalysisDepth,
   AnalysisReport,
   AnalysisSchedule,
   AnalysisScheduleRequest,
@@ -401,7 +552,7 @@ const reportFilters = ref({
 
 const analysisForm = ref({
   tableName: undefined as string | undefined,
-  depth: 'standard' as 'quick' | 'standard' | 'deep',
+  depth: 'standard' as AnalysisDepth,
   resourceName: undefined as string | undefined,
 });
 
@@ -409,7 +560,7 @@ const buildScheduleForm = () => ({
   id: undefined as string | undefined,
   name: '',
   tables: [] as string[],
-  depth: 'standard' as 'quick' | 'standard' | 'deep',
+  depth: 'standard' as AnalysisDepth,
   resource_name: undefined as string | undefined,
   schedule_type: 'daily' as 'hourly' | 'daily' | 'weekly' | 'monthly',
   schedule_hour: 8,
@@ -432,6 +583,7 @@ const depthOptions = [
   { label: 'Quick', value: 'quick' },
   { label: 'Standard', value: 'standard' },
   { label: 'Deep', value: 'deep' },
+  { label: 'Expert', value: 'expert' },
 ];
 
 const statusOptions = [
@@ -522,7 +674,7 @@ const openReport = async (reportId: string) => {
   reportDrawerOpen.value = true;
   reportDetailLoading.value = true;
   try {
-    const response = await dorisApi.analysis.getReport(reportId);
+    const response = await dorisApi.analysis.getReport(reportId, true);
     selectedReport.value = response.data;
   } catch (error: any) {
     message.error('加载报告详情失败: ' + extractApiErrorMessage(error));
@@ -736,6 +888,23 @@ const statusColor = (status?: string) => {
   return 'default';
 };
 
+const confidenceColor = (score?: number | null) => {
+  if (typeof score !== 'number') return 'default';
+  if (score >= 0.8) return 'green';
+  if (score >= 0.6) return 'gold';
+  return 'red';
+};
+
+const formatConfidence = (score?: number | null) => {
+  if (typeof score !== 'number') return 'Confidence -';
+  return `Confidence ${(score * 100).toFixed(0)}%`;
+};
+
+const formatJson = (value: unknown) => {
+  if (value == null) return '-';
+  return JSON.stringify(value, null, 2);
+};
+
 const formatDuration = (durationMs?: number) => {
   if (!durationMs) return '耗时 -';
   return `耗时 ${(durationMs / 1000).toFixed(1)}s`;
@@ -777,6 +946,41 @@ onMounted(async () => {
 
 .analysis-result {
   margin-top: 8px;
+}
+
+.expert-mode-note {
+  margin-bottom: 16px;
+}
+
+.evidence-card {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #d9e3f0;
+  border-radius: 8px;
+  background: #f8fbff;
+}
+
+.inline-metric {
+  margin-top: 4px;
+  color: #475467;
+  font-size: 12px;
+}
+
+.round-result-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.reasoning-preview {
+  margin: 0;
+  padding: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  border-radius: 8px;
+  background: #fdf7f2;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .sql-preview {

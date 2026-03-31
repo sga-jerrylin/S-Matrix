@@ -150,17 +150,28 @@ export interface AnalysisInsight {
   severity?: string;
 }
 
+export type AnalysisDepth = 'quick' | 'standard' | 'deep' | 'expert';
+
 export interface AnalysisReport {
   id: string;
   table_names: string;
   trigger_type?: string;
-  depth?: string;
+  depth?: AnalysisDepth | string;
   schedule_id?: string | null;
   history_id?: string | null;
   summary?: string;
   insights?: AnalysisInsight[];
   anomalies?: any[];
   recommendations?: string[];
+  limitations?: string[];
+  root_causes?: any[];
+  conversation_chain?: any[];
+  reasoning_traces?: Array<{ round?: number; trace?: string }>;
+  evidence_chains?: any[];
+  confidence_ratings?: {
+    overall?: number | null;
+    [key: string]: any;
+  };
   failed_step_count?: number;
   insight_count?: number;
   anomaly_count?: number;
@@ -184,7 +195,7 @@ export interface AnalysisDeliveryConfig {
 export interface AnalysisScheduleRequest {
   name: string;
   tables: string[];
-  depth?: 'quick' | 'standard' | 'deep';
+  depth?: AnalysisDepth;
   resource_name?: string;
   schedule_type: 'hourly' | 'daily' | 'weekly' | 'monthly';
   schedule_hour?: number;
@@ -199,7 +210,7 @@ export interface AnalysisScheduleRequest {
 export interface AnalysisScheduleUpdateRequest {
   name?: string;
   tables?: string[];
-  depth?: 'quick' | 'standard' | 'deep';
+  depth?: AnalysisDepth;
   resource_name?: string;
   schedule_type?: 'hourly' | 'daily' | 'weekly' | 'monthly';
   schedule_hour?: number;
@@ -215,7 +226,7 @@ export interface AnalysisSchedule {
   id: string;
   name: string;
   tables: string[];
-  depth: 'quick' | 'standard' | 'deep';
+  depth: AnalysisDepth;
   resource_name?: string;
   schedule_type: 'hourly' | 'daily' | 'weekly' | 'monthly';
   schedule_hour: number;
@@ -295,15 +306,25 @@ export const dorisApi = {
 
   // 数据分析
   analysis: {
-    analyzeTable: (tableName: string, depth: 'quick' | 'standard' | 'deep' = 'standard', resourceName?: string) =>
+    analyzeTable: (tableName: string, depth: 'quick' | 'standard' | 'deep' | 'expert' = 'standard', resourceName?: string) =>
       api.post(`/api/analysis/table/${tableName}`, { depth, resource_name: resourceName }),
     replayHistory: (historyId: string, resourceName?: string) =>
       api.post(`/api/analysis/replay/${historyId}`, { resource_name: resourceName }),
     listReports: (params?: { table_names?: string; limit?: number; offset?: number }) =>
       api.get('/api/analysis/reports', { params }),
-    getReport: (id: string) => api.get(`/api/analysis/reports/${id}`),
+    getReport: (id: string, includeReasoning: boolean = false) =>
+      api.get(`/api/analysis/reports/${id}`, {
+        params: {
+          include_reasoning: includeReasoning ? 'true' : undefined,
+        },
+      }),
     deleteReport: (id: string) => api.delete(`/api/analysis/reports/${id}`),
-    latestReport: (tableName: string) => api.get(`/api/analysis/reports/latest/${tableName}`),
+    latestReport: (tableName: string, includeReasoning: boolean = false) =>
+      api.get(`/api/analysis/reports/latest/${tableName}`, {
+        params: {
+          include_reasoning: includeReasoning ? 'true' : undefined,
+        },
+      }),
     listSchedules: () => api.get('/api/analysis/schedules'),
     createSchedule: (data: AnalysisScheduleRequest) => api.post('/api/analysis/schedules', data),
     updateSchedule: (id: string, data: AnalysisScheduleUpdateRequest) =>

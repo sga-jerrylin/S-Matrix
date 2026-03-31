@@ -195,6 +195,48 @@ def test_create_schedule_round_trip():
     assert payload["schedules"][0]["name"] == "Morning revenue"
 
 
+def test_create_schedule_accepts_expert_depth():
+    scheduler, _db = _build_scheduler()
+
+    created = scheduler.create_schedule(
+        {
+            "name": "Expert schedule",
+            "tables": ["sales"],
+            "depth": "expert",
+            "schedule_type": "daily",
+            "schedule_hour": 8,
+            "schedule_minute": 30,
+            "timezone": "UTC",
+        }
+    )
+
+    assert created["success"] is True
+    assert created["schedule"]["depth"] == "expert"
+
+
+def test_run_now_skips_concurrent_expert_schedule():
+    scheduler, _db = _build_scheduler()
+    created = scheduler.create_schedule(
+        {
+            "name": "Expert schedule",
+            "tables": ["sales"],
+            "depth": "expert",
+            "schedule_type": "daily",
+            "schedule_hour": 8,
+            "schedule_minute": 0,
+            "timezone": "UTC",
+        }
+    )
+
+    scheduler._running_schedule_ids.add(created["schedule"]["id"])
+    result = scheduler.run_now(created["schedule"]["id"])
+
+    assert result["success"] is False
+    assert result["skipped"] is True
+    assert result["reason"] == "already_running"
+    assert scheduler.agent.calls == []
+
+
 def test_run_now_triggers_analysis_for_each_table():
     scheduler, _db = _build_scheduler()
     created = scheduler.create_schedule(
