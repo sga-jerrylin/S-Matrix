@@ -594,6 +594,8 @@ class AnalystAgent:
         return dict(base_api_config or {})
 
     def _call_strategist(self, prompt: str, strategist_config: Dict[str, Any]) -> Dict[str, Any]:
+        import httpx as _httpx
+
         model_name = (strategist_config.get("model") or "").lower()
         is_reasoner = "reasoner" in model_name or re.search(r"(^|[^a-z0-9])r1([^a-z0-9]|$)", model_name) is not None
         if is_reasoner:
@@ -601,31 +603,52 @@ class AnalystAgent:
                 "model": strategist_config["model"],
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 8000,
+                "stream": True,
             }
-            timeout = 120
+            timeout = 300
         else:
             payload = {
                 "model": strategist_config["model"],
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1,
                 "max_tokens": 4000,
+                "stream": True,
             }
-            timeout = 60
+            timeout = 120
 
-        response = requests.post(
-            f"{strategist_config['base_url'].rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {strategist_config['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        choice = response.json()["choices"][0]["message"]
-        content = choice.get("content", "")
+        url = f"{strategist_config['base_url'].rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {strategist_config['api_key']}",
+            "Content-Type": "application/json",
+        }
+
+        # Use SSE streaming to avoid Docker TCP keepalive drops on long R1 responses
+        reasoning_chunks: List[str] = []
+        content_chunks: List[str] = []
+
+        with _httpx.Client(timeout=_httpx.Timeout(float(timeout), connect=30.0)) as client:
+            with client.stream("POST", url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk["choices"][0].get("delta", {})
+                        if delta.get("reasoning_content"):
+                            reasoning_chunks.append(delta["reasoning_content"])
+                        if delta.get("content"):
+                            content_chunks.append(delta["content"])
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        pass
+
+        content = "".join(content_chunks)
+        reasoning = "".join(reasoning_chunks)
         return {
-            "reasoning": choice.get("reasoning_content", ""),
+            "reasoning": reasoning,
             "response": self._parse_json_from_text(content),
         }
 
@@ -1358,25 +1381,43 @@ class AnalystAgent:
         user_prompt: str,
         api_config: Dict[str, Any],
     ) -> str:
-        response = requests.post(
-            f"{api_config['base_url'].rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_config['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": api_config["model"],
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.1,
-                "max_tokens": 3000,
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        url = f"{api_config['base_url'].rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_config['api_key']}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": api_config["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 3000,
+        }
+        import httpx as _httpx
+
+        payload["stream"] = True
+        content_chunks: List[str] = []
+
+        with _httpx.Client(timeout=_httpx.Timeout(120.0, connect=30.0)) as client:
+            with client.stream("POST", url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk["choices"][0].get("delta", {})
+                        if delta.get("content"):
+                            content_chunks.append(delta["content"])
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        pass
+
+        return "".join(content_chunks)
 
     def _merge_table_names(
         self,
