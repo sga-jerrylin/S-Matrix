@@ -80,11 +80,12 @@ services:
       - DORIS_DATABASE=doris_db
       - DORIS_STREAM_LOAD_HOST=smatrix-be
       - DORIS_STREAM_LOAD_PORT=8040
-      - DEEPSEEK_API_KEY=sk-748638f482f74b7392a6dafd89bdd307
-      - DEEPSEEK_MODEL=deepseek-chat
-      - DEEPSEEK_BASE_URL=https://api.deepseek.com
-      # 固定加密密钥，确保密码加密一致
-      - ENCRYPTION_KEY=dITsw-d5mJGd4qrPln29AldqAy8GCb4lMvvZvQGRBQU=
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - SMATRIX_API_KEY=${SMATRIX_API_KEY}
+      - SMATRIX_CORS_ORIGINS=${SMATRIX_CORS_ORIGINS:-http://localhost:35173}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
 
   # Frontend Web UI
   smatrix-frontend:
@@ -93,6 +94,8 @@ services:
       dockerfile: Dockerfile
     container_name: smatrix-frontend
     restart: always
+    environment:
+      - SMATRIX_API_KEY=${SMATRIX_API_KEY}
     ports:
       - "35173:80"
     networks:

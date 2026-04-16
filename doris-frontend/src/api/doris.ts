@@ -1,4 +1,5 @@
-import axios from 'axios';
+import axios, { AxiosHeaders } from 'axios';
+import { applyGatewayAuthHeaders, resolveGatewayApiKey } from './auth';
 
 // 使用相对路径,通过 Nginx 代理到后端
 // 开发环境: http://localhost:8000
@@ -14,11 +15,66 @@ const api = axios.create({
   },
 });
 
+api.interceptors.request.use((config) => {
+  const apiKey = resolveGatewayApiKey({
+    envApiKey: import.meta.env.VITE_SMATRIX_API_KEY,
+  });
+
+  const nextHeaders = applyGatewayAuthHeaders(
+    { ...(config.headers as Record<string, string | undefined> | undefined) },
+    apiKey,
+  );
+  const axiosHeaders = AxiosHeaders.from(config.headers);
+  for (const [key, value] of Object.entries(nextHeaders)) {
+    if (typeof value === 'string' && value) {
+      axiosHeaders.set(key, value);
+    } else {
+      axiosHeaders.delete(key);
+    }
+  }
+  config.headers = axiosHeaders;
+  return config;
+});
+
 export interface ExecuteRequest {
   action: string;
   table?: string;
   column?: string;
   params?: Record<string, any>;
+}
+
+export interface QueryCatalogField {
+  field_name: string;
+  display_name: string;
+  description?: string;
+  field_type?: string;
+  semantic?: string;
+  semantic_label?: string;
+  enum_values?: string[];
+  value_range?: [number, number] | null;
+}
+
+export interface QueryCatalogRelationship {
+  id?: string;
+  related_table_name: string;
+  related_display_name: string;
+  relation_type?: string;
+  relation_type_label?: string;
+  relation_label?: string;
+  relation_description?: string;
+  source_field_name: string;
+  source_field_display_name: string;
+  target_field_name: string;
+  target_field_display_name: string;
+}
+
+export interface QueryCatalogTable {
+  table_name: string;
+  display_name: string;
+  description?: string;
+  source_type?: string;
+  fields: QueryCatalogField[];
+  relationships: QueryCatalogRelationship[];
 }
 
 export interface LLMConfigRequest {
@@ -33,6 +89,8 @@ export interface LLMConfigRequest {
 
 export interface NaturalQueryRequest {
   query: string;
+  resource_name?: string;
+  table_names?: string[];
   api_key?: string;
   model?: string;
   base_url?: string;
@@ -86,12 +144,121 @@ export interface UpdateTableRegistryRequest {
   description?: string;
 }
 
+export interface AnalysisInsight {
+  title: string;
+  detail: string;
+  severity?: string;
+  urgency?: string;
+}
+
+export type AnalysisDepth = 'quick' | 'standard' | 'deep' | 'expert';
+
+export interface AnalysisReport {
+  id: string;
+  table_names: string;
+  trigger_type?: string;
+  depth?: AnalysisDepth | string;
+  schedule_id?: string | null;
+  history_id?: string | null;
+  summary?: string;
+  executive_summary?: string;
+  insights?: AnalysisInsight[];
+  top_insights?: AnalysisInsight[];
+  anomalies?: any[];
+  recommendations?: string[];
+  action_items?: AnalysisInsight[];
+  limitations?: string[];
+  root_causes?: any[];
+  conversation_chain?: any[];
+  reasoning_traces?: Array<{ round?: number; trace?: string }>;
+  evidence_chains?: any[];
+  confidence_ratings?: {
+    overall?: number | null;
+    [key: string]: any;
+  };
+  failed_step_count?: number;
+  insight_count?: number;
+  anomaly_count?: number;
+  status?: string;
+  duration_ms?: number;
+  created_at?: string;
+  steps?: any[];
+}
+
+export interface AnalysisDeliveryChannel {
+  type: 'webhook' | 'websocket';
+  format?: 'generic' | 'slack' | 'dingtalk';
+  webhook_url?: string;
+  webhook_token?: string;
+}
+
+export interface AnalysisDeliveryConfig {
+  channels: AnalysisDeliveryChannel[];
+}
+
+export interface AnalysisScheduleRequest {
+  name: string;
+  tables: string[];
+  depth?: AnalysisDepth;
+  resource_name?: string;
+  schedule_type: 'hourly' | 'daily' | 'weekly' | 'monthly';
+  schedule_hour?: number;
+  schedule_minute?: number;
+  schedule_day_of_week?: number;
+  schedule_day_of_month?: number;
+  timezone?: string;
+  delivery?: AnalysisDeliveryConfig;
+  enabled?: boolean;
+}
+
+export interface AnalysisScheduleUpdateRequest {
+  name?: string;
+  tables?: string[];
+  depth?: AnalysisDepth;
+  resource_name?: string;
+  schedule_type?: 'hourly' | 'daily' | 'weekly' | 'monthly';
+  schedule_hour?: number;
+  schedule_minute?: number;
+  schedule_day_of_week?: number;
+  schedule_day_of_month?: number;
+  timezone?: string;
+  delivery?: AnalysisDeliveryConfig;
+  enabled?: boolean;
+}
+
+export interface AnalysisSchedule {
+  id: string;
+  name: string;
+  tables: string[];
+  depth: AnalysisDepth;
+  resource_name?: string;
+  schedule_type: 'hourly' | 'daily' | 'weekly' | 'monthly';
+  schedule_hour: number;
+  schedule_minute: number;
+  schedule_day_of_week: number;
+  schedule_day_of_month: number;
+  timezone: string;
+  delivery?: AnalysisDeliveryConfig;
+  enabled: boolean;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export type UploadImportMode = 'replace' | 'append';
+
 export const dorisApi = {
   // 健康检查
   health: () => api.get('/api/health'),
 
   // 获取所有表
   getTables: () => api.get('/api/tables'),
+
+  // 获取面向业务语义的查询目录
+  queryCatalog: {
+    list: () => api.get('/api/query/catalog'),
+  },
 
   // 获取表结构
   getTableSchema: (tableName: string) => api.get(`/api/tables/${tableName}/schema`),
@@ -110,7 +277,13 @@ export const dorisApi = {
   },
 
   // Excel 上传导入
-  uploadExcel: (file: File, tableName: string, columnMapping?: Record<string, string>, createTable: boolean = true) => {
+  uploadExcel: (
+    file: File,
+    tableName: string,
+    columnMapping?: Record<string, string>,
+    createTable: boolean = true,
+    importMode: UploadImportMode = 'replace',
+  ) => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('table_name', tableName);
@@ -118,6 +291,7 @@ export const dorisApi = {
       formData.append('column_mapping', JSON.stringify(columnMapping));
     }
     formData.append('create_table', createTable.toString());
+    formData.append('import_mode', importMode);
     return api.post('/api/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
@@ -133,6 +307,36 @@ export const dorisApi = {
 
   // 自然语言查询 (Text-to-SQL)
   naturalQuery: (data: NaturalQueryRequest) => api.post('/api/query/natural', data),
+
+  // 数据分析
+  analysis: {
+    analyzeTable: (tableName: string, depth: 'quick' | 'standard' | 'deep' | 'expert' = 'standard', resourceName?: string) =>
+      api.post(`/api/analysis/table/${tableName}`, { depth, resource_name: resourceName }),
+    replayHistory: (historyId: string, resourceName?: string) =>
+      api.post(`/api/analysis/replay/${historyId}`, { resource_name: resourceName }),
+    listReports: (params?: { table_names?: string; limit?: number; offset?: number }) =>
+      api.get('/api/analysis/reports', { params }),
+    getReport: (id: string, includeReasoning: boolean = false) =>
+      api.get(`/api/analysis/reports/${id}`, {
+        params: {
+          include_reasoning: includeReasoning ? 'true' : undefined,
+        },
+      }),
+    deleteReport: (id: string) => api.delete(`/api/analysis/reports/${id}`),
+    latestReport: (tableName: string, includeReasoning: boolean = false) =>
+      api.get(`/api/analysis/reports/latest/${tableName}`, {
+        params: {
+          include_reasoning: includeReasoning ? 'true' : undefined,
+        },
+      }),
+    listSchedules: () => api.get('/api/analysis/schedules'),
+    createSchedule: (data: AnalysisScheduleRequest) => api.post('/api/analysis/schedules', data),
+    updateSchedule: (id: string, data: AnalysisScheduleUpdateRequest) =>
+      api.put(`/api/analysis/schedules/${id}`, data),
+    deleteSchedule: (id: string) => api.delete(`/api/analysis/schedules/${id}`),
+    toggleSchedule: (id: string) => api.post(`/api/analysis/schedules/${id}/toggle`),
+    runNow: (id: string) => api.post(`/api/analysis/schedules/${id}/run`),
+  },
 
   // 数据源管理
   datasource: {
@@ -191,6 +395,12 @@ export const dorisApi = {
     list: () => api.get('/api/table-registry'),
     update: (tableName: string, data: UpdateTableRegistryRequest) =>
       api.put(`/api/table-registry/${tableName}`, data),
+    delete: (tableName: string, options?: { dropPhysical?: boolean; cleanupHistory?: boolean }) => {
+      const params = new URLSearchParams({
+        drop_physical: String(options?.dropPhysical ?? true),
+        cleanup_history: String(options?.cleanupHistory ?? true),
+      });
+      return api.delete(`/api/table-registry/${tableName}?${params.toString()}`);
+    },
   },
 };
-

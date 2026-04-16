@@ -34,6 +34,24 @@
           </a-row>
         </a-form-item>
 
+        <a-form-item label="查询范围">
+          <a-select
+            v-model:value="queryForm.selectedTables"
+            mode="multiple"
+            allow-clear
+            show-search
+            option-filter-prop="label"
+            placeholder="默认自动选择；可指定 1 张或多张表来缩小 AI 查询范围"
+            :loading="tablesLoading"
+            :options="tableOptions"
+            :max-tag-count="responsiveTagCount"
+            @focus="loadTables"
+          />
+          <div class="scope-hint">
+            当前系统只有一个 Doris 库；这里按已同步表限制 AI 的查询范围，能减少全表扫描式推理。
+          </div>
+        </a-form-item>
+
         <a-form-item label="自然语言问题" required>
           <a-textarea
             v-model:value="queryForm.query"
@@ -65,8 +83,8 @@
           style="margin-bottom: 16px"
         />
 
-        <a-collapse style="margin-bottom: 16px" :default-active-key="['1']">
-          <a-collapse-panel key="1" header="生成的 SQL 查询">
+        <a-collapse style="margin-bottom: 16px" :default-active-key="[]">
+          <a-collapse-panel key="1" header="调试信息：生成的 SQL 查询">
             <pre class="sql-code">{{ result.sql }}</pre>
           </a-collapse-panel>
         </a-collapse>
@@ -84,21 +102,37 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { message } from 'ant-design-vue';
 import { SearchOutlined } from '@ant-design/icons-vue';
 import { dorisApi } from '../api/doris';
+import { extractApiErrorMessage } from '../api/errors';
+import { normalizeLLMResource } from '../api/llm-resources';
+import { buildNaturalQueryPayload } from './natural-query-state';
 
 const queryForm = ref({
   query: '',
   selectedResource: undefined as string | undefined,
   apiKey: '',
+  selectedTables: [] as string[],
 });
 
 const resources = ref<any[]>([]);
 const resourcesLoading = ref(false);
+const tablesLoading = ref(false);
+const availableTables = ref<any[]>([]);
 const querying = ref(false);
 const result = ref<any>(null);
+const responsiveTagCount = 'responsive';
+
+const tableOptions = computed(() =>
+  availableTables.value.map((table) => ({
+    label: table.display_name
+      ? `${table.display_name} (${table.table_name})`
+      : table.table_name,
+    value: table.table_name,
+  })),
+);
 
 const resultColumns = computed(() => {
   if (!result.value || !result.value.data || result.value.data.length === 0) return [];
@@ -117,11 +151,25 @@ const loadResources = async () => {
   resourcesLoading.value = true;
   try {
     const response = await dorisApi.llm.list();
-    resources.value = response.data.resources || [];
+    resources.value = (response.data.resources || []).map((resource: any) => normalizeLLMResource(resource));
   } catch (error: any) {
-    message.error('加载 AI 资源失败: ' + (error.response?.data?.detail || error.message));
+    message.error('加载 AI 资源失败: ' + extractApiErrorMessage(error));
   } finally {
     resourcesLoading.value = false;
+  }
+};
+
+const loadTables = async () => {
+  if (availableTables.value.length > 0) return;
+
+  tablesLoading.value = true;
+  try {
+    const response = await dorisApi.tableRegistry.list();
+    availableTables.value = response.data.tables || [];
+  } catch (error: any) {
+    message.error('加载查询范围失败: ' + extractApiErrorMessage(error));
+  } finally {
+    tablesLoading.value = false;
   }
 };
 
@@ -138,24 +186,12 @@ const handleQuery = async () => {
 
   querying.value = true;
   try {
-    // 如果选择了资源,从资源中获取 API Key
-    let apiKey = queryForm.value.apiKey;
-    if (queryForm.value.selectedResource && !apiKey) {
-      const selectedRes = resources.value.find(r => r.name === queryForm.value.selectedResource);
-      if (selectedRes && selectedRes.api_key) {
-        apiKey = selectedRes.api_key;
-      }
-    }
-
-    const response = await dorisApi.naturalQuery({
-      query: queryForm.value.query,
-      api_key: apiKey || undefined,
-    });
+    const response = await dorisApi.naturalQuery(buildNaturalQueryPayload(queryForm.value));
     
     result.value = response.data;
     message.success('查询成功');
   } catch (error: any) {
-    const errorMsg = error.response?.data?.detail?.error || error.response?.data?.detail || error.message;
+    const errorMsg = extractApiErrorMessage(error);
     message.error('查询失败: ' + errorMsg);
     console.error('Natural query error:', error);
   } finally {
@@ -165,8 +201,14 @@ const handleQuery = async () => {
 
 const handleClear = () => {
   queryForm.value.query = '';
+  queryForm.value.apiKey = '';
   result.value = null;
 };
+
+onMounted(() => {
+  loadResources();
+  loadTables();
+});
 </script>
 
 <style scoped>
@@ -183,5 +225,10 @@ const handleClear = () => {
   font-size: 13px;
   line-height: 1.5;
 }
-</style>
 
+.scope-hint {
+  margin-top: 8px;
+  color: #666;
+  font-size: 12px;
+}
+</style>

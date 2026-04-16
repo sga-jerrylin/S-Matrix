@@ -23,7 +23,7 @@ services:
       - API_HOST=0.0.0.0
       - API_PORT=8000
       # 加密密钥（用于加密数据库密码）
-      - ENCRYPTION_KEY=dITsw-d5mJGd4qrPln29AldqAy8GCb4lMvvZvQGRBQU=
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
     networks:
       - doris_doris-network
     restart: unless-stopped
