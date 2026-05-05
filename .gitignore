@@ -9,3 +9,7 @@ dist/
 .worktrees/
 .plans/progress.local.md
 doris-api/tests/golden_queries.local.json
+_tmp/
+_tmp*
+.tmp_*.json
+.codex_tmp/

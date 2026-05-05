@@ -12,15 +12,53 @@ class CoordinatorAgent:
         sql_map: Dict[str, str],
         relationships: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
+        return self.coordinate_with_trace(plan, sql_map, relationships)["sql"]
+
+    def coordinate_with_trace(
+        self,
+        plan: Dict[str, Any],
+        sql_map: Dict[str, str],
+        relationships: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         if not plan.get("needs_join") or len(sql_map) <= 1:
-            return next(iter(sql_map.values()))
+            return {
+                "sql": next(iter(sql_map.values())),
+                "trace": {
+                    "strategy": "passthrough",
+                    "input_tables": list(sql_map.keys()),
+                    "candidate_relationship_count": len(relationships or []),
+                    "selected_relationship": None,
+                },
+            }
 
         relationships = relationships or []
         preferred = self._select_relationship(sql_map, relationships)
         if preferred:
-            return self._build_join_sql(sql_map, preferred)
+            return {
+                "sql": self._build_join_sql(sql_map, preferred),
+                "trace": {
+                    "strategy": "relationship_join",
+                    "input_tables": list(sql_map.keys()),
+                    "candidate_relationship_count": len(
+                        [
+                            rel
+                            for rel in relationships
+                            if rel.get("table_a") in sql_map and rel.get("table_b") in sql_map
+                        ]
+                    ),
+                    "selected_relationship": preferred,
+                },
+            }
 
-        return next(iter(sql_map.values()))
+        return {
+            "sql": next(iter(sql_map.values())),
+            "trace": {
+                "strategy": "fallback_first_sql",
+                "input_tables": list(sql_map.keys()),
+                "candidate_relationship_count": 0,
+                "selected_relationship": None,
+            },
+        }
 
     def _select_relationship(
         self,

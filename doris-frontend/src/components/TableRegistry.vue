@@ -1,6 +1,6 @@
 <template>
   <div class="table-registry">
-    <a-card title="已同步表格">
+    <a-card :title="`已同步表格 (${tables.length})`">
       <a-row :gutter="16">
         <a-col :span="12">
           <a-input-search
@@ -93,6 +93,10 @@ import { InfoCircleOutlined } from '@ant-design/icons-vue';
 import { dorisApi } from '../api/doris';
 import { extractApiErrorMessage } from '../api/errors';
 
+const emit = defineEmits<{
+  (event: 'count-loaded', count: number): void;
+}>();
+
 const loading = ref(false);
 const saving = ref(false);
 const deletingTableName = ref('');
@@ -131,6 +135,7 @@ const loadRegistry = async () => {
   try {
     const response = await dorisApi.tableRegistry.list();
     tables.value = response.data.tables || [];
+    emit('count-loaded', tables.value.length);
   } catch (error: any) {
     message.error('加载同步表失败: ' + extractApiErrorMessage(error));
   } finally {

@@ -129,6 +129,8 @@ def test_natural_query_auto_repairs_failed_sql(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["sql"] == "SELECT COUNT(*) AS total FROM `institutions`"
+    assert response.json()["trace"]["repair"]["attempted"] is True
+    assert response.json()["trace"]["repair"]["attempts"][0]["succeeded"] is True
     assert main.doris_client.execute_query_async.await_count == 2
     assert RecordingHistoryVanna.calls[0]["sql"] == "SELECT COUNT(*) AS total FROM `institutions`"
 
@@ -203,3 +205,30 @@ def test_mcp_server_ignores_notification_without_response():
     )
 
     assert response is None
+
+
+def test_mcp_server_legacy_tools_list_does_not_pollute_runtime_tools():
+    import mcp_server
+    from dc_runtime import mcp_server as runtime_mcp_server
+
+    legacy_response = mcp_server.handle_jsonrpc_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/list",
+            "params": {},
+        }
+    )
+    legacy_tool_names = {tool["name"] for tool in legacy_response["result"]["tools"]}
+    assert "query_natural" in legacy_tool_names
+
+    runtime_response = runtime_mcp_server.handle_jsonrpc_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/list",
+            "params": {},
+        }
+    )
+    runtime_tool_names = {tool["name"] for tool in runtime_response["result"]["tools"]}
+    assert "query_natural" not in runtime_tool_names

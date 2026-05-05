@@ -6,9 +6,22 @@ import os
 import json
 import asyncio
 import hashlib
+import logging
+import re
+from urllib.parse import urlsplit, urlunsplit
 from typing import Dict, Any, Optional
 from datetime import datetime
 from db import doris_client
+from llm_executor import LLMExecutionError, LLMExecutor
+
+
+logger = logging.getLogger(__name__)
+_RESOURCE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]{0,127}$")
+_METADATA_DEFAULT_RESOURCE = os.getenv("METADATA_DEFAULT_RESOURCE", "openrutor")
+_METADATA_RESOURCE_TIMEOUT_SECONDS = int(os.getenv("METADATA_RESOURCE_TIMEOUT_SECONDS", "45"))
+_METADATA_RESOURCE_QUERY_TIMEOUT_SECONDS = int(
+    os.getenv("METADATA_RESOURCE_QUERY_TIMEOUT_SECONDS", "45")
+)
 
 
 class MetadataAnalyzer:
@@ -21,14 +34,356 @@ class MetadataAnalyzer:
         self.model = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
         self.base_url = os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
 
+    @staticmethod
+    def _derive_base_url(endpoint: str) -> str:
+        if not endpoint:
+            return ""
+        parts = urlsplit(endpoint)
+        path = parts.path or ""
+        suffix = "/chat/completions"
+        if path.endswith(suffix):
+            path = path[: -len(suffix)] or "/"
+        return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+    @staticmethod
+    def _normalize_llm_resource(row_group: Dict[str, Any]) -> Dict[str, Any]:
+        properties = dict(row_group.get("properties") or {})
+        name = row_group.get("ResourceName") or row_group.get("Name") or ""
+        provider = (
+            properties.get("ai.provider_type")
+            or properties.get("provider")
+            or row_group.get("ResourceType")
+            or ""
+        )
+        model = properties.get("ai.model_name") or properties.get("model_name") or ""
+        endpoint = properties.get("ai.endpoint") or properties.get("endpoint") or ""
+        api_key_value = properties.get("ai.api_key") or properties.get("api_key") or ""
+        api_key_configured = bool(api_key_value and str(api_key_value).strip("* "))
+        if not api_key_configured and api_key_value:
+            api_key_configured = True
+        return {
+            **row_group,
+            "name": name,
+            "provider": provider,
+            "model": model,
+            "endpoint": endpoint,
+            "base_url": MetadataAnalyzer._derive_base_url(endpoint),
+            "api_key_configured": api_key_configured,
+            "properties": properties,
+        }
+
+    def _load_llm_resources(self) -> list:
+        sql = 'SHOW RESOURCES WHERE NAME LIKE "%"'
+        rows = self.db.execute_query(sql) or []
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            name = row.get("Name")
+            resource_type = row.get("ResourceType")
+            if resource_type != "ai" or not name:
+                continue
+            if name not in grouped:
+                grouped[name] = {"ResourceName": name, "ResourceType": resource_type, "properties": {}}
+            item = row.get("Item")
+            value = row.get("Value")
+            if item and value is not None:
+                grouped[name]["properties"][item] = value
+        return [self._normalize_llm_resource(item) for item in grouped.values()]
+
+    def _resolve_resource_for_metadata(self, resource_name: Optional[str]) -> Dict[str, Any]:
+        requested = (resource_name or "").strip()
+        if requested and not _RESOURCE_NAME_RE.match(requested):
+            return {
+                "success": False,
+                "error_code": "invalid_resource_name",
+                "message": "resource_name format is invalid",
+                "status_code": 400,
+                "resource_name": requested,
+            }
+
+        resources = self._load_llm_resources()
+        selected = None
+        if requested:
+            selected = next((item for item in resources if item.get("name") == requested), None)
+            if not selected:
+                return {
+                    "success": False,
+                    "error_code": "resource_not_found",
+                    "message": f"LLM resource '{requested}' not found",
+                    "status_code": 400,
+                    "resource_name": requested,
+                }
+        else:
+            preferred = _METADATA_DEFAULT_RESOURCE.strip()
+            if preferred:
+                selected = next(
+                    (
+                        item
+                        for item in resources
+                        if str(item.get("name") or "").strip().lower() == preferred.lower()
+                    ),
+                    None,
+                )
+            if selected is None and resources:
+                selected = resources[0]
+
+        return {"success": True, "selected": selected, "resources": resources}
+
+    def _build_runtime_api_config(self, resource_name: Optional[str]) -> Dict[str, Any]:
+        resource_resolution = self._resolve_resource_for_metadata(resource_name)
+        if not resource_resolution.get("success"):
+            return resource_resolution
+
+        selected = resource_resolution.get("selected") or {}
+        env_api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+        resource_api_key_configured = bool(selected.get("api_key_configured"))
+        has_resource = bool(selected)
+
+        llm_execution_mode = "direct_api"
+        if has_resource and resource_api_key_configured:
+            llm_execution_mode = "doris_resource"
+
+        runtime = {
+            "api_key": env_api_key,
+            "model": selected.get("model") or os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            "base_url": selected.get("base_url") or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            "resource_name": selected.get("name") if has_resource else None,
+            "endpoint": selected.get("endpoint") if has_resource else None,
+            "provider": selected.get("provider") if has_resource else None,
+            "resource_found": has_resource,
+            "resource_api_key_configured": resource_api_key_configured,
+            "llm_execution_mode": llm_execution_mode,
+            "resource_timeout_seconds": max(1, int(_METADATA_RESOURCE_TIMEOUT_SECONDS)),
+            "resource_query_timeout_seconds": max(1, int(_METADATA_RESOURCE_QUERY_TIMEOUT_SECONDS)),
+        }
+
+        if llm_execution_mode == "direct_api" and not env_api_key:
+            return {
+                "success": False,
+                "error_code": "missing_llm_configuration",
+                "message": (
+                    "No usable LLM resource or direct API key is configured for metadata analysis."
+                ),
+                "status_code": 500,
+                "resource_name": runtime.get("resource_name"),
+                "llm_execution_mode": llm_execution_mode,
+            }
+
+        return {"success": True, "api_config": runtime}
+
+    @staticmethod
+    def _structured_error(
+        *,
+        code: str,
+        message: str,
+        status_code: int = 500,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "status_code": status_code,
+            "error": {
+                "code": code,
+                "message": message,
+                "details": details or {},
+            },
+        }
+
+    @staticmethod
+    def _is_timeout_llm_error(llm_error: LLMExecutionError) -> bool:
+        error_code = str(getattr(llm_error, "error_code", "") or "").strip().lower()
+        if error_code in {"resource_timeout", "timeout"}:
+            return True
+        return "timeout" in str(llm_error).lower()
+
+    def _parse_llm_json(self, content: str) -> Dict[str, Any]:
+        candidate = str(content or "")
+        if '```json' in candidate:
+            candidate = candidate.split('```json', 1)[1].split('```', 1)[0]
+        elif '```' in candidate:
+            candidate = candidate.split('```', 1)[1].split('```', 1)[0]
+        try:
+            parsed = json.loads(candidate.strip())
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return {
+            "description": str(content or ""),
+            "columns": {},
+            "suggested_queries": [],
+            "raw_response": str(content or ""),
+        }
+
+    def _call_llm_with_runtime(self, prompt: str, api_config: Dict[str, Any]) -> Dict[str, Any]:
+        executor = LLMExecutor(doris_client=self.db, api_config=api_config)
+        content = executor.call(
+            prompt=prompt,
+            system_prompt="你是一个数据分析专家，擅长分析数据表结构和用途。请用中文回答。",
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        return self._parse_llm_json(content)
+
+    @staticmethod
+    def _fallback_display_name(table_name: str) -> str:
+        explicit = {
+            "orders": "订单主表",
+            "order_items": "订单商品明细表",
+            "order_payment_trade": "订单支付流水表",
+            "member": "会员主表",
+            "inventory_realtime": "实时库存表",
+        }
+        return explicit.get(table_name, table_name)
+
+    def _build_fallback_analysis(
+        self,
+        table_name: str,
+        columns: Optional[list] = None,
+        sample_data: Optional[list] = None,
+    ) -> Dict[str, Any]:
+        columns = list(columns or [])
+        sample_row = (sample_data or [{}])[0] or {}
+        column_descriptions: Dict[str, str] = {}
+        for column_name in columns:
+            lower_name = str(column_name or "").lower()
+            sample_value = sample_row.get(column_name)
+            if isinstance(sample_value, bool):
+                type_hint = "布尔"
+            elif isinstance(sample_value, int):
+                type_hint = "整数"
+            elif isinstance(sample_value, float):
+                type_hint = "数值"
+            elif sample_value is None:
+                type_hint = "未知类型"
+            else:
+                type_hint = "文本"
+
+            if any(marker in lower_name for marker in ["time", "date", "created", "updated"]):
+                semantic_hint = "时间字段"
+            elif any(marker in lower_name for marker in ["amount", "paid", "price", "fee", "total", "balance"]):
+                semantic_hint = "金额字段"
+            elif lower_name.endswith("_id") or any(marker in lower_name for marker in ["member", "user", "tenant"]):
+                semantic_hint = "标识字段"
+            else:
+                semantic_hint = "业务字段"
+
+            column_descriptions[column_name] = f"{semantic_hint}，{type_hint}"
+
+        return {
+            "display_name": self._fallback_display_name(table_name),
+            "description": f"{table_name} 的业务数据明细表（fallback semantic）",
+            "columns": column_descriptions,
+            "suggested_queries": [
+                f"{table_name} 按时间趋势统计",
+                f"{table_name} 核心金额指标分析",
+                f"{table_name} 关键维度分组统计",
+            ],
+            "data_domain": "业务数据",
+            "key_dimensions": ["时间", "门店/租户", "金额/数量"],
+        }
+
+    def _ensure_analysis_column_coverage(
+        self,
+        table_name: str,
+        analysis: Dict[str, Any],
+        columns: Optional[list] = None,
+        sample_data: Optional[list] = None,
+    ) -> Dict[str, Any]:
+        merged = dict(analysis or {})
+        fallback = self._build_fallback_analysis(table_name, columns, sample_data)
+        existing_columns = merged.get("columns")
+        if not isinstance(existing_columns, dict):
+            existing_columns = {}
+
+        fallback_columns = fallback.get("columns") or {}
+        for column_name, description in fallback_columns.items():
+            if not str(existing_columns.get(column_name) or "").strip():
+                existing_columns[column_name] = description
+
+        merged["columns"] = existing_columns
+        if not str(merged.get("display_name") or "").strip():
+            merged["display_name"] = fallback.get("display_name")
+        if not str(merged.get("description") or "").strip():
+            merged["description"] = fallback.get("description")
+        if not isinstance(merged.get("suggested_queries"), list) or not merged.get("suggested_queries"):
+            merged["suggested_queries"] = fallback.get("suggested_queries") or []
+        if not str(merged.get("data_domain") or "").strip():
+            merged["data_domain"] = fallback.get("data_domain")
+        if not isinstance(merged.get("key_dimensions"), list) or not merged.get("key_dimensions"):
+            merged["key_dimensions"] = fallback.get("key_dimensions") or []
+        return merged
+
     def _json_dumps_safe(self, value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
-    
-    async def analyze_table_async(self, table_name: str, source_type: str = 'excel') -> Dict[str, Any]:
-        """异步分析表格元数据"""
-        return await asyncio.to_thread(self.analyze_table, table_name, source_type)
 
-    def analyze_table(self, table_name: str, source_type: str = 'excel') -> Dict[str, Any]:
+    def _mark_table_analysis_status(
+        self,
+        table_name: str,
+        status: str,
+        *,
+        analyzed_at: Optional[str] = None,
+    ) -> None:
+        safe_table_name = (table_name or "").strip()
+        if not safe_table_name:
+            return
+
+        try:
+            exists = self.db.execute_query(
+                "SELECT table_name FROM `_sys_table_sources` WHERE table_name = %s LIMIT 1",
+                (safe_table_name,),
+            )
+        except Exception:
+            return
+
+        if not exists:
+            return
+
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if analyzed_at:
+            sql = """
+            UPDATE `_sys_table_sources`
+            SET analysis_status = %s,
+                last_analyzed_at = %s,
+                updated_at = %s
+            WHERE table_name = %s
+            """
+            params = (status, analyzed_at, now, safe_table_name)
+        else:
+            sql = """
+            UPDATE `_sys_table_sources`
+            SET analysis_status = %s,
+                updated_at = %s
+            WHERE table_name = %s
+            """
+            params = (status, now, safe_table_name)
+
+        try:
+            self.db.execute_update(sql, params)
+        except Exception:
+            pass
+    
+    async def analyze_table_async(
+        self,
+        table_name: str,
+        source_type: str = 'excel',
+        *,
+        resource_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """异步分析表格元数据"""
+        return await asyncio.to_thread(
+            self.analyze_table,
+            table_name,
+            source_type,
+            resource_name=resource_name,
+        )
+
+    def analyze_table(
+        self,
+        table_name: str,
+        source_type: str = 'excel',
+        *,
+        resource_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         分析表格元数据
         
@@ -39,11 +394,21 @@ class MetadataAnalyzer:
         Returns:
             分析结果
         """
-        if not self.api_key:
-            return {
-                'success': False,
-                'error': 'API key not configured. Set DEEPSEEK_API_KEY environment variable.'
-            }
+        runtime_resolution = self._build_runtime_api_config(resource_name)
+        if not runtime_resolution.get("success"):
+            self._mark_table_analysis_status(table_name, "failed")
+            return self._structured_error(
+                code=str(runtime_resolution.get("error_code") or "llm_config_error"),
+                message=str(runtime_resolution.get("message") or "Failed to resolve LLM runtime configuration"),
+                status_code=int(runtime_resolution.get("status_code") or 500),
+                details={
+                    "resource_name": runtime_resolution.get("resource_name"),
+                    "llm_execution_mode": runtime_resolution.get("llm_execution_mode"),
+                },
+            )
+        runtime_api_config = runtime_resolution.get("api_config") or {}
+        columns: list = []
+        sample_data: list = []
         
         try:
             # 校验表名
@@ -64,27 +429,82 @@ class MetadataAnalyzer:
             sample_data = self.db.execute_query(sample_sql)
             
             # 3. 构造 prompt
-            prompt = self._build_analysis_prompt(table_name, columns, sample_data)
+            prompt = self._build_compact_analysis_prompt(table_name, columns, sample_data)
             
             # 4. 调用 LLM
-            analysis = self._call_llm(prompt)
-            
+            analysis = self._call_llm_with_runtime(prompt, runtime_api_config)
+            analysis = self._ensure_analysis_column_coverage(table_name, analysis, columns, sample_data)
+             
             # 5. 保存元数据
             self._save_metadata(table_name, analysis, source_type)
-            
+            self._update_registry_semantics(table_name, analysis)
+            self.refresh_agent_assets(
+                table_name,
+                source_type,
+                runtime_api_config=runtime_api_config,
+            )
+             
             return {
                 'success': True,
                 'table_name': table_name,
-                'analysis': analysis
+                'analysis': analysis,
+                'llm_execution_mode': runtime_api_config.get("llm_execution_mode"),
+                'resource_name': runtime_api_config.get("resource_name"),
             }
-            
+             
+        except LLMExecutionError as llm_error:
+            if (
+                self._is_timeout_llm_error(llm_error)
+                and runtime_api_config.get("llm_execution_mode") == "doris_resource"
+            ):
+                fallback_analysis = self._build_fallback_analysis(table_name, columns, sample_data)
+                fallback_analysis = self._ensure_analysis_column_coverage(
+                    table_name,
+                    fallback_analysis,
+                    columns,
+                    sample_data,
+                )
+                fallback_analysis["fallback_reason"] = "resource_timeout"
+                fallback_analysis["fallback_error"] = str(llm_error)
+                try:
+                    self._save_metadata(table_name, fallback_analysis, source_type)
+                    self._update_registry_semantics(table_name, fallback_analysis)
+                    self.refresh_agent_assets(
+                        table_name,
+                        source_type,
+                        runtime_api_config=runtime_api_config,
+                    )
+                    return {
+                        "success": True,
+                        "table_name": table_name,
+                        "analysis": fallback_analysis,
+                        "llm_execution_mode": runtime_api_config.get("llm_execution_mode"),
+                        "resource_name": runtime_api_config.get("resource_name"),
+                        "fallback_used": True,
+                        "fallback_reason": "resource_timeout",
+                    }
+                except Exception:
+                    pass
+
+            self._mark_table_analysis_status(table_name, "failed")
+            return self._structured_error(
+                code=str(llm_error.error_code or "llm_execution_failed"),
+                message=str(llm_error),
+                status_code=502,
+                details={
+                    "resource_name": llm_error.resource_name,
+                    "llm_execution_mode": llm_error.llm_execution_mode,
+                },
+            )
         except Exception as e:
             import traceback
-            return {
-                'success': False,
-                'error': str(e),
-                'traceback': traceback.format_exc()
-            }
+            self._mark_table_analysis_status(table_name, "failed")
+            return self._structured_error(
+                code="metadata_analysis_failed",
+                message=str(e),
+                status_code=500,
+                details={"traceback": traceback.format_exc()},
+            )
     
     def _build_analysis_prompt(self, table_name: str, columns: list, 
                                sample_data: list) -> str:
@@ -105,6 +525,7 @@ class MetadataAnalyzer:
 
 请以 JSON 格式返回以下信息：
 {{
+    "display_name": "适合业务人员阅读的中文表名，不超过20字",
     "description": "一句话描述这张表的用途和内容",
     "columns": {{
         "列名1": "该列的含义和数据类型说明",
@@ -123,6 +544,71 @@ class MetadataAnalyzer:
         
         return prompt
     
+    def _build_compact_analysis_prompt(self, table_name: str, columns: list,
+                                       sample_data: list) -> str:
+        """Build a compact prompt to avoid oversized AI_GENERATE payloads."""
+        column_limit = 48
+        sample_row_limit = 3
+        sample_column_limit = 18
+        sample_value_limit = 120
+        max_prompt_chars = 12000
+
+        def _short_value(value: Any) -> str:
+            text = str(value if value is not None else "null")
+            if len(text) > sample_value_limit:
+                return text[:sample_value_limit] + "...(truncated)"
+            return text
+
+        safe_columns = list(columns or [])
+        preview_columns = safe_columns[:column_limit]
+        column_hint = ", ".join(preview_columns)
+        if len(safe_columns) > column_limit:
+            column_hint = f"{column_hint}, ... (+{len(safe_columns) - column_limit} more columns)"
+
+        sample_lines = []
+        for idx, row in enumerate((sample_data or [])[:sample_row_limit], 1):
+            row = row or {}
+            row_columns = [name for name in preview_columns[:sample_column_limit] if name in row]
+            if not row_columns:
+                row_columns = list(row.keys())[:sample_column_limit]
+            fields = [f"{name}: {_short_value(row.get(name))}" for name in row_columns]
+            omitted = max(0, len(row.keys()) - len(row_columns))
+            if omitted:
+                fields.append(f"... (+{omitted} more fields)")
+            sample_lines.append(f"  row{idx}: " + ", ".join(fields))
+
+        sample_block = "\n".join(sample_lines) if sample_lines else "  (no sample rows)"
+        prompt = f"""请分析以下数据表并返回结构化元数据（仅输出 JSON，不要额外解释）。
+
+table_name: {table_name}
+columns_preview: {column_hint}
+columns_total: {len(safe_columns)}
+
+sample_rows:
+{sample_block}
+
+输出 JSON:
+{{
+  "display_name": "适合业务阅读的中文表名，不超过20字",
+  "description": "一句话描述该表业务用途",
+  "columns": {{
+    "列名1": "列含义和数据类型说明",
+    "列名2": "列含义和数据类型说明"
+  }},
+  "suggested_queries": [
+    "可基于该表回答的问题示例1",
+    "可基于该表回答的问题示例2",
+    "可基于该表回答的问题示例3"
+  ],
+  "data_domain": "数据领域",
+  "key_dimensions": ["主要分析维度1", "主要分析维度2"]
+}}
+"""
+        if len(prompt) > max_prompt_chars:
+            prompt = prompt[:max_prompt_chars].rstrip()
+            prompt += "\n\n(提示: 输入已截断，请基于可见字段稳健推断。)"
+        return prompt
+
     def _call_llm(self, prompt: str) -> Dict[str, Any]:
         """调用 LLM API"""
         import requests
@@ -146,23 +632,7 @@ class MetadataAnalyzer:
         )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
-        
-        # 尝试解析 JSON
-        try:
-            # 清理可能的 markdown 代码块
-            if '```json' in content:
-                content = content.split('```json')[1].split('```')[0]
-            elif '```' in content:
-                content = content.split('```')[1].split('```')[0]
-            
-            return json.loads(content.strip())
-        except json.JSONDecodeError:
-            return {
-                "description": content,
-                "columns": {},
-                "suggested_queries": [],
-                "raw_response": content
-            }
+        return self._parse_llm_json(content)
     
     def _save_metadata(self, table_name: str, analysis: Dict[str, Any], 
                        source_type: str):
@@ -188,6 +658,22 @@ class MetadataAnalyzer:
             now,
             source_type
         ))
+        self._mark_table_analysis_status(table_name, "ready", analyzed_at=now)
+
+    def _update_registry_semantics(self, table_name: str, analysis: Dict[str, Any]) -> None:
+        display_name = str(analysis.get("display_name") or "").strip() or self._fallback_display_name(table_name)
+        description = str(analysis.get("description") or "").strip()
+        if not display_name and not description:
+            return
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        sql = """
+        UPDATE `_sys_table_registry`
+        SET display_name = COALESCE(NULLIF(%s, ''), display_name),
+            description = COALESCE(NULLIF(%s, ''), description),
+            updated_at = %s
+        WHERE table_name = %s
+        """
+        self.db.execute_update(sql, (display_name, description, now, table_name))
 
     def _save_agent_config(self, table_name: str, agent_config: Dict[str, Any], source_hash: str):
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -259,10 +745,17 @@ class MetadataAnalyzer:
         for field_name in columns_info.keys() or sample_row.keys():
             sample_value = sample_row.get(field_name)
             field_cfg = {"semantic": "text", "match": "like"}
+            lower_name = str(field_name or "").strip().lower()
             if any(keyword in field_name for keyword in ["市", "省", "区", "县", "城市"]):
                 field_cfg = {"semantic": "geographic-city", "match": "fuzzy"}
-            elif any(keyword in field_name for keyword in ["年", "日期", "时间"]):
+            elif any(keyword in field_name for keyword in ["年", "日期", "时间"]) or any(
+                marker in lower_name for marker in ["date", "time", "created", "updated"]
+            ):
                 field_cfg = {"semantic": "temporal-year", "match": "range"}
+            elif any(marker in lower_name for marker in ["member", "user", "tenant"]) or lower_name.endswith("_id"):
+                field_cfg = {"semantic": "id", "match": "exact"}
+            elif any(marker in lower_name for marker in ["amount", "paid", "price", "balance", "fee", "total", "num"]):
+                field_cfg = {"semantic": "financial-income", "match": "range"}
             elif isinstance(sample_value, (int, float)):
                 field_cfg = {"semantic": "financial-income", "match": "range"}
             if isinstance(sample_value, str):
@@ -275,10 +768,21 @@ class MetadataAnalyzer:
             "cot_template": "识别查询维度，按字段匹配策略生成 WHERE 和聚合条件。",
         }
 
-    def refresh_agent_assets(self, table_name: str, source_type: str = "excel") -> Dict[str, Any]:
+    def refresh_agent_assets(
+        self,
+        table_name: str,
+        source_type: str = "excel",
+        *,
+        runtime_api_config: Optional[Dict[str, Any]] = None,
+        resource_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         metadata = self.get_metadata(table_name)
         if not metadata:
-            return {"success": False, "error": "metadata not found"}
+            return self._structured_error(
+                code="metadata_not_found",
+                message="metadata not found",
+                status_code=404,
+            )
 
         safe_table_name = self.db.validate_identifier(table_name)
         sample_data = self.db.execute_query(f"SELECT * FROM {safe_table_name} LIMIT 10")
@@ -288,7 +792,25 @@ class MetadataAnalyzer:
 
         prompt = self._build_agent_prompt(table_name, metadata, sample_data)
         try:
-            agent_config = self._call_llm(prompt)
+            if runtime_api_config and runtime_api_config.get("llm_execution_mode") == "doris_resource":
+                # Keep metadata analysis on LLM resource, but avoid a second expensive
+                # AI_GENERATE round for agent assets on wide/large tables.
+                agent_config = self._fallback_agent_config(metadata, sample_data)
+            elif runtime_api_config:
+                agent_config = self._call_llm_with_runtime(prompt, runtime_api_config)
+            elif resource_name:
+                runtime_resolution = self._build_runtime_api_config(resource_name)
+                if runtime_resolution.get("success"):
+                    agent_config = self._call_llm_with_runtime(
+                        prompt,
+                        runtime_resolution.get("api_config") or {},
+                    )
+                else:
+                    raise ValueError(
+                        str(runtime_resolution.get("message") or "Failed to resolve runtime config for agent assets")
+                    )
+            else:
+                agent_config = self._call_llm(prompt)
         except Exception:
             agent_config = self._fallback_agent_config(metadata, sample_data)
 

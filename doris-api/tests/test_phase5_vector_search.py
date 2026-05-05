@@ -1,6 +1,5 @@
 import uuid
 
-from datasource_handler import DataSourceHandler
 from embedding import EmbeddingService
 from vanna_doris import VannaDoris
 
@@ -15,7 +14,10 @@ class FakeVectorDorisClient:
     def execute_query(self, sql, params=None):
         self.executed_queries.append((sql, params))
         if self.query_results:
-            return self.query_results.pop(0)
+            result = self.query_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         return []
 
     def execute_update(self, sql, params=None):
@@ -90,6 +92,8 @@ def test_get_similar_question_sql_prefers_vector_search():
 
 
 def test_ensure_query_history_vector_support_executes_alter_and_index():
+    from datasource_handler import DataSourceHandler
+
     handler = DataSourceHandler()
     handler.db = FakeVectorDorisClient()
 
@@ -99,3 +103,65 @@ def test_ensure_query_history_vector_support_executes_alter_and_index():
     statements = [sql for sql, _ in handler.db.executed_updates]
     assert any("ALTER TABLE `_sys_query_history` ADD COLUMN `question_embedding` ARRAY<FLOAT>" in sql for sql in statements)
     assert any("USING ANN" in sql for sql in statements)
+
+
+def test_get_similar_question_sql_with_trace_reports_vector_source():
+    client = FakeVectorDorisClient(
+        query_results=[
+            [{"question": "广州有多少机构？", "sql": "SELECT COUNT(*) FROM `institutions`", "score": 0.9}],
+        ]
+    )
+    vanna = SamplePhase5Vanna(doris_client=client)
+    vanna.embedding_service = EmbeddingService(provider="hashing", dimension=8)
+
+    result = vanna.get_similar_question_sql_with_trace("广州组织数量")
+
+    assert len(result["examples"]) == 1
+    assert result["trace"]["memory_hit"] is True
+    assert result["trace"]["fallback_used"] is False
+    assert result["trace"]["selected_source"] == "query_history.vector"
+    assert result["trace"]["source_labels"] == ["query_history.vector"]
+
+
+def test_get_similar_question_sql_with_trace_reports_like_fallback():
+    client = FakeVectorDorisClient(
+        query_results=[
+            Exception("Unknown column question_embedding"),
+            [],
+            [{"question": "广州有多少机构？", "sql": "SELECT COUNT(*) FROM `institutions`"}],
+        ]
+    )
+    vanna = SamplePhase5Vanna(doris_client=client)
+    vanna.embedding_service = EmbeddingService(provider="hashing", dimension=8)
+
+    result = vanna.get_similar_question_sql_with_trace("广州组织数量")
+
+    assert len(result["examples"]) == 1
+    assert result["trace"]["memory_hit"] is True
+    assert result["trace"]["fallback_used"] is True
+    assert result["trace"]["selected_source"] == "query_history.like_keyword"
+    assert "query_history.match_any" in result["trace"]["sources_attempted"]
+    assert "query_history.like_keyword" in result["trace"]["source_labels"]
+
+
+def test_get_similar_question_sql_with_trace_returns_empty_when_all_history_retrieval_fails():
+    client = FakeVectorDorisClient(
+        query_results=[
+            Exception("vector failed: table not found"),
+            Exception("match_any failed: table not found"),
+            Exception("like failed: table not found"),
+        ]
+    )
+    vanna = SamplePhase5Vanna(doris_client=client)
+    vanna.embedding_service = EmbeddingService(provider="hashing", dimension=8)
+
+    result = vanna.get_similar_question_sql_with_trace("广州组织数量")
+
+    assert result["examples"] == []
+    assert result["trace"]["memory_hit"] is False
+    assert result["trace"]["fallback_used"] is True
+    assert result["trace"]["selected_source"] == ""
+    assert "query_history.vector" in result["trace"]["sources_attempted"]
+    assert "query_history.match_any" in result["trace"]["sources_attempted"]
+    assert "query_history.like_keyword" in result["trace"]["sources_attempted"]
+    assert len(result["trace"]["errors"]) == 3

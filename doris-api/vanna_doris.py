@@ -8,9 +8,10 @@ import logging
 import re
 import uuid
 from typing import List, Dict, Any, Optional
-from vanna.base import VannaBase
 from db import DorisClient
 from embedding import EmbeddingService
+from llm_executor import LLMExecutor
+from vanna_compat import VannaBase
 
 try:
     from cachetools import TTLCache
@@ -284,6 +285,39 @@ class VannaDoris(VannaBase):
 
         return docs
 
+    def get_related_ddl_with_trace(self, question: str, **kwargs) -> Dict[str, Any]:
+        """
+        Retrieve related DDL along with a stable trace contract.
+        """
+        cache_key = f"{self.doris_client.config['database']}:information_schema.columns"
+        cache_hit = cache_key in self._ddl_cache
+        ddl_list = self.get_related_ddl(question, **kwargs)
+        return {
+            "items": ddl_list,
+            "trace": {
+                "count": len(ddl_list),
+                "source_labels": ["information_schema.columns"],
+                "cache_hit": cache_hit,
+            },
+        }
+
+    def get_related_documentation_with_trace(self, question: str, **kwargs) -> Dict[str, Any]:
+        """
+        Retrieve related documentation along with a stable trace contract.
+        """
+        docs = self.get_related_documentation(question, **kwargs)
+        return {
+            "items": docs,
+            "trace": {
+                "count": len(docs),
+                "source_labels": [
+                    "_sys_table_registry",
+                    "_sys_table_metadata",
+                    "_sys_table_agents",
+                ],
+            },
+        }
+
     # Training data methods (required by VannaBase but not used in our implementation)
     def add_ddl(self, ddl: str, **kwargs) -> str:
         """Add DDL to training data (not implemented)"""
@@ -381,12 +415,30 @@ class VannaDoris(VannaBase):
         """Generate embedding for semantic retrieval."""
         return self.embedding_service.embed_text(data)
 
-    def get_similar_question_sql(self, question: str, **kwargs) -> List[Dict[str, str]]:
-        """Retrieve similar approved history rows using vector search with text fallback."""
+    def get_similar_question_sql_with_trace(self, question: str, **kwargs) -> Dict[str, Any]:
+        """Retrieve similar history rows and emit stable memory retrieval trace."""
         limit = int(kwargs.get("limit", 3))
         match_rows: List[Dict[str, Any]] = []
+        selected_source = ""
+        sources_attempted: List[str] = []
+        fallback_used = False
+        errors: List[Dict[str, str]] = []
+
+        def _record_error(source: str, error: Exception) -> None:
+            message = str(error) or error.__class__.__name__
+            errors.append({"source": source, "error": message})
+
+        def _normalize_rows(rows: Any) -> List[Dict[str, Any]]:
+            if not isinstance(rows, list):
+                return []
+            normalized: List[Dict[str, Any]] = []
+            for row in rows:
+                if isinstance(row, dict):
+                    normalized.append(row)
+            return normalized
 
         try:
+            sources_attempted.append("query_history.vector")
             question_embedding = self.generate_embedding(question)
             vector_literal = self.embedding_service.to_doris_array_literal(question_embedding)
             metric = os.getenv("SMATRIX_VECTOR_METRIC", "inner_product")
@@ -405,14 +457,30 @@ class VannaDoris(VannaBase):
             ORDER BY score {order_direction}, `is_empty_result` ASC, `created_at` DESC
             LIMIT %s
             """
-            match_rows = self.doris_client.execute_query(vector_sql, (limit,))
+            match_rows = _normalize_rows(self.doris_client.execute_query(vector_sql, (limit,)))
         except Exception as vector_error:
             logger.debug("vector retrieval unavailable, fallback to text search: %s", vector_error)
+            _record_error("query_history.vector", vector_error)
             match_rows = []
 
         if match_rows:
-            return [{"question": row.get("question", ""), "sql": row.get("sql", "")} for row in match_rows[:limit]]
+            selected_source = "query_history.vector"
+            examples = [{"question": row.get("question", ""), "sql": row.get("sql", "")} for row in match_rows[:limit]]
+            return {
+                "examples": examples,
+                "trace": {
+                    "memory_hit": bool(examples),
+                    "fallback_used": False,
+                    "selected_source": selected_source,
+                    "source_labels": [selected_source],
+                    "sources_attempted": sources_attempted,
+                    "candidate_count": len(examples),
+                    "limit": limit,
+                    "errors": errors,
+                },
+            }
 
+        fallback_used = True
         match_sql = """
         SELECT `question`, `sql`, `is_empty_result`, `created_at`
         FROM `_sys_query_history`
@@ -422,14 +490,30 @@ class VannaDoris(VannaBase):
         LIMIT %s
         """
         try:
-            match_rows = self.doris_client.execute_query(match_sql, (question, limit))
-        except Exception:
+            sources_attempted.append("query_history.match_any")
+            match_rows = _normalize_rows(self.doris_client.execute_query(match_sql, (question, limit)))
+            if match_rows:
+                selected_source = "query_history.match_any"
+        except Exception as match_any_error:
+            _record_error("query_history.match_any", match_any_error)
             match_rows = []
 
         if not match_rows:
             keywords = self._extract_search_keywords(question)
             if not keywords:
-                return []
+                return {
+                    "examples": [],
+                    "trace": {
+                        "memory_hit": False,
+                        "fallback_used": fallback_used,
+                        "selected_source": "",
+                        "source_labels": [],
+                        "sources_attempted": sources_attempted,
+                        "candidate_count": 0,
+                        "limit": limit,
+                        "errors": errors,
+                    },
+                }
 
             like_clauses = " OR ".join(["`question` LIKE %s"] * len(keywords))
             like_sql = f"""
@@ -441,9 +525,34 @@ class VannaDoris(VannaBase):
             LIMIT %s
             """
             params = tuple(f"%{keyword}%" for keyword in keywords) + (limit,)
-            match_rows = self.doris_client.execute_query(like_sql, params)
+            try:
+                sources_attempted.append("query_history.like_keyword")
+                match_rows = _normalize_rows(self.doris_client.execute_query(like_sql, params))
+                if match_rows:
+                    selected_source = "query_history.like_keyword"
+            except Exception as like_error:
+                _record_error("query_history.like_keyword", like_error)
+                match_rows = []
 
-        return [{"question": row.get("question", ""), "sql": row.get("sql", "")} for row in match_rows[:limit]]
+        examples = [{"question": row.get("question", ""), "sql": row.get("sql", "")} for row in match_rows[:limit]]
+        return {
+            "examples": examples,
+            "trace": {
+                "memory_hit": bool(examples),
+                "fallback_used": fallback_used,
+                "selected_source": selected_source,
+                "source_labels": [selected_source] if selected_source else [],
+                "sources_attempted": sources_attempted,
+                "candidate_count": len(examples),
+                "limit": limit,
+                "errors": errors,
+            },
+        }
+
+    def get_similar_question_sql(self, question: str, **kwargs) -> List[Dict[str, str]]:
+        """Retrieve similar approved history rows using vector search with text fallback."""
+        result = self.get_similar_question_sql_with_trace(question, **kwargs)
+        return list(result.get("examples") or [])
 
     def extract_table_names(self, sql: str) -> List[str]:
         """Best-effort extraction of table names from FROM/JOIN clauses."""
@@ -745,6 +854,111 @@ class VannaDoris(VannaBase):
         return sql
 
 
+class LegacyVannaAdapter:
+    """
+    Tool-style adapter that keeps Vanna 2 legacy path while exposing explicit stages.
+    """
+
+    def __init__(self, vanna: VannaDoris):
+        self.vanna = vanna
+
+    def memory_retrieval(self, question: str, limit: int = 5) -> Dict[str, Any]:
+        try:
+            if hasattr(self.vanna, "get_similar_question_sql_with_trace"):
+                result = self.vanna.get_similar_question_sql_with_trace(question, limit=limit)
+                return {
+                    "examples": list(result.get("examples") or []),
+                    "trace": dict(result.get("trace") or {}),
+                }
+
+            if hasattr(self.vanna, "get_similar_question_sql"):
+                examples = self.vanna.get_similar_question_sql(question, limit=limit)
+            else:
+                examples = []
+            return {
+                "examples": examples,
+                "trace": {
+                    "memory_hit": bool(examples),
+                    "fallback_used": False,
+                    "selected_source": "query_history.legacy",
+                    "source_labels": ["query_history.legacy"] if examples else [],
+                    "sources_attempted": ["query_history.legacy"],
+                    "candidate_count": len(examples),
+                    "limit": limit,
+                    "errors": [],
+                },
+            }
+        except Exception as retrieval_error:
+            logger.warning("memory retrieval failed and downgraded: %s", retrieval_error)
+            return {
+                "examples": [],
+                "trace": {
+                    "memory_hit": False,
+                    "fallback_used": True,
+                    "selected_source": "",
+                    "source_labels": [],
+                    "sources_attempted": ["query_history.adapter"],
+                    "candidate_count": 0,
+                    "limit": limit,
+                    "errors": [
+                        {
+                            "source": "query_history.adapter",
+                            "error": str(retrieval_error) or retrieval_error.__class__.__name__,
+                        }
+                    ],
+                },
+            }
+
+    def ddl_doc_retrieval(self, question: str) -> Dict[str, Any]:
+        if hasattr(self.vanna, "get_related_ddl_with_trace"):
+            ddl_result = self.vanna.get_related_ddl_with_trace(question)
+        else:
+            if hasattr(self.vanna, "get_related_ddl"):
+                ddl_items = self.vanna.get_related_ddl(question)
+            else:
+                ddl_items = []
+            ddl_result = {
+                "items": ddl_items,
+                "trace": {
+                    "count": len(ddl_items),
+                    "source_labels": ["ddl.legacy"],
+                    "cache_hit": False,
+                },
+            }
+
+        if hasattr(self.vanna, "get_related_documentation_with_trace"):
+            doc_result = self.vanna.get_related_documentation_with_trace(question)
+        else:
+            if hasattr(self.vanna, "get_related_documentation"):
+                doc_items = self.vanna.get_related_documentation(question)
+            else:
+                doc_items = []
+            doc_result = {
+                "items": doc_items,
+                "trace": {
+                    "count": len(doc_items),
+                    "source_labels": ["documentation.legacy"],
+                },
+            }
+
+        source_labels = sorted(
+            {
+                *list((ddl_result.get("trace") or {}).get("source_labels") or []),
+                *list((doc_result.get("trace") or {}).get("source_labels") or []),
+            }
+        )
+        return {
+            "ddl": list(ddl_result.get("items") or []),
+            "documentation": list(doc_result.get("items") or []),
+            "trace": {
+                "ddl_count": int((ddl_result.get("trace") or {}).get("count", 0)),
+                "documentation_count": int((doc_result.get("trace") or {}).get("count", 0)),
+                "source_labels": source_labels,
+                "ddl_cache_hit": bool((ddl_result.get("trace") or {}).get("cache_hit", False)),
+            },
+        }
+
+
 class VannaDorisOpenAI(VannaDoris):
     """
     Vanna.AI with OpenAI (or compatible API like DeepSeek) for Doris
@@ -754,6 +968,7 @@ class VannaDorisOpenAI(VannaDoris):
                  api_key: str = None,
                  model: str = None,
                  base_url: str = None,
+                 api_config: Optional[Dict[str, Any]] = None,
                  config: Optional[Dict[str, Any]] = None):
         """
         Initialize Vanna with OpenAI-compatible API
@@ -772,6 +987,13 @@ class VannaDorisOpenAI(VannaDoris):
         self.api_key = api_key
         self.model = model or 'deepseek-chat'
         self.base_url = base_url or 'https://api.deepseek.com'
+        resolved_api_config = dict(api_config or {})
+        resolved_api_config.setdefault("api_key", self.api_key)
+        resolved_api_config.setdefault("model", self.model)
+        resolved_api_config.setdefault("base_url", self.base_url)
+        resolved_api_config.setdefault("llm_execution_mode", "direct_api")
+        self.api_config = resolved_api_config
+        self.llm_executor = LLMExecutor(doris_client=self.doris_client, api_config=self.api_config)
 
     def system_message(self, message: str) -> Dict[str, str]:
         """Create a system message"""
@@ -795,28 +1017,9 @@ class VannaDorisOpenAI(VannaDoris):
         Returns:
             LLM response
         """
-        import requests
-
-        # Prepare API request
-        url = f"{self.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-
-        data = {
-            "model": self.model,
-            "messages": [
-                self.system_message("You are an expert SQL query generator for Apache Doris database."),
-                self.user_message(prompt)
-            ],
-            "temperature": self.config.get('temperature', 0.1) if self.config else 0.1,
-            "max_tokens": self.config.get('max_tokens', 2000) if self.config else 2000
-        }
-
-        # Submit to API
-        response = requests.post(url, headers=headers, json=data, timeout=60)
-        response.raise_for_status()
-
-        result = response.json()
-        return result['choices'][0]['message']['content']
+        return self.llm_executor.call(
+            prompt=prompt,
+            system_prompt="You are an expert SQL query generator for Apache Doris database.",
+            temperature=self.config.get('temperature', 0.1) if self.config else 0.1,
+            max_tokens=self.config.get('max_tokens', 2000) if self.config else 2000,
+        )

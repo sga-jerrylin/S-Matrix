@@ -1,41 +1,270 @@
 [
   {
-    "question": "广州有多少机构？",
-    "expected_sql_pattern": "COUNT|count",
-    "expected_sql_contains": ["广州"],
-    "forbidden_sql_pattern": "SELECT\\s+\\*",
-    "expected_min_rows": 1,
-    "allow_empty_result": false,
-    "expected_columns_any": ["count", "total", "COUNT(*)"]
+    "question": "查询订单总数",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["orders"],
+    "expected_table_names": ["orders"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic": "count",
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["sql_reuse", "prompt_context", "none", "degraded"],
+      "auto": ["sql_reuse", "prompt_context", "none", "degraded"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_allowed", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown"],
+      "auto": ["reuse_allowed", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown"]
+    },
+    "max_latency_seconds": 30
   },
   {
-    "question": "来自广州的机构",
-    "expected_sql_pattern": "LIKE\\s+'%广州%'",
-    "expected_min_rows": 0,
-    "expected_result_contains": ["广州"]
+    "question": "查询订单表前10条",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["orders"],
+    "expected_table_names": ["orders"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic": "listing",
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["sql_reuse", "prompt_context", "rejected", "none", "degraded"],
+      "auto": ["sql_reuse", "prompt_context", "rejected", "none", "degraded"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_cross_table", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_cross_table", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 30
   },
   {
-    "question": "2022年广东省收入超5万的机构有多少？",
-    "expected_sql_pattern": "2022|收入|5",
-    "expected_sql_contains": ["广东"],
-    "forbidden_sql_pattern": "SELECT\\s+\\*",
-    "expected_min_rows": 1,
-    "allow_empty_result": false,
-    "expected_columns_any": ["count", "total", "COUNT(*)"]
+    "question": "最近7天订单每天数量趋势",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["orders"],
+    "expected_table_names": ["orders"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic_by_kernel": {
+      "legacy": ["trend", "count"],
+      "native": ["trend", "count"],
+      "auto": ["trend", "count"]
+    },
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["prompt_context", "none", "degraded"],
+      "auto": ["prompt_context", "none", "degraded"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 60
   },
   {
-    "question": "2022年广州收入超5万的机构中，哪些参加了2023年的活动？",
-    "expected_sql_pattern": "JOIN|join|2023",
-    "expected_min_rows": 0,
-    "expected_result_contains": ["广州"]
+    "question": "最近7天订单每天付款金额",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["order_payment_trade"],
+    "expected_table_names": ["order_payment_trade"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic_by_kernel": {
+      "legacy": ["trend", "count"],
+      "native": ["trend", "count"],
+      "auto": ["trend", "count"]
+    },
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["prompt_context", "none", "degraded"],
+      "auto": ["prompt_context", "none", "degraded"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 60
   },
   {
-    "question": "不存在的测试城市有多少机构？",
-    "expected_sql_pattern": "COUNT|count",
-    "forbidden_sql_pattern": "SELECT\\s+\\*",
-    "expected_min_rows": 1,
-    "allow_empty_result": false,
-    "expected_columns_any": ["count", "total", "COUNT(*)"],
-    "expected_result_contains": []
+    "question": "查询会员表前10条",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["member"],
+    "expected_table_names": ["member"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic": "listing",
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["sql_reuse", "prompt_context", "rejected", "none", "degraded"],
+      "auto": ["sql_reuse", "prompt_context", "rejected", "none", "degraded"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_cross_table", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_cross_table", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 30
+  },
+  {
+    "question": "查询最近30天订单实付金额总和",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["order_payment_trade"],
+    "expected_table_names": ["order_payment_trade"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic": "amount_sum",
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["sql_reuse", "prompt_context", "none", "degraded"],
+      "auto": ["sql_reuse", "prompt_context", "none", "degraded"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 60
+  },
+  {
+    "question": "查询会员总数",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["member"],
+    "expected_table_names": ["member"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic": "count",
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["sql_reuse", "prompt_context", "none", "degraded"],
+      "auto": ["sql_reuse", "prompt_context", "none", "degraded"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 30
+  },
+  {
+    "question": "查询支付流水总金额",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["order_payment_trade"],
+    "expected_table_names": ["order_payment_trade"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic": "amount_sum",
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["sql_reuse", "prompt_context", "none", "degraded"],
+      "auto": ["sql_reuse", "prompt_context", "none", "degraded"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 60
+  },
+  {
+    "question": "查询商品明细中销量最高的10个商品",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["order_items"],
+    "expected_table_names": ["order_items"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic": "listing",
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["prompt_context", "rejected", "none", "degraded", "sql_reuse"],
+      "auto": ["prompt_context", "rejected", "none", "degraded", "sql_reuse"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_cross_table", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_cross_table", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 30
+  },
+  {
+    "question": "查询当前库存数量最高的10个商品",
+    "expected_status": 200,
+    "expected_success": true,
+    "expected_schema_version": "nlq.v1",
+    "require_trace_schema": true,
+    "require_execution_llm_fields": true,
+    "require_sql_executable": true,
+    "require_native_memory_gate_fields": true,
+    "expected_selected_tables": ["inventory_realtime"],
+    "expected_table_names": ["inventory_realtime"],
+    "expected_fallback_used": false,
+    "forbidden_selected_tables": ["warehouse_stock_out_items"],
+    "expected_sql_semantic": "listing",
+    "expected_native_memory_used_as_by_kernel": {
+      "legacy": ["none", "degraded"],
+      "native": ["prompt_context", "rejected", "none", "degraded", "sql_reuse"],
+      "auto": ["prompt_context", "rejected", "none", "degraded", "sql_reuse"]
+    },
+    "expected_reuse_gate_reason_by_kernel": {
+      "legacy": "",
+      "native": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_cross_table", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"],
+      "auto": ["reuse_allowed", "reuse_blocked_intent_mismatch", "reuse_blocked_low_confidence", "reuse_blocked_cross_table", "reuse_blocked_no_candidate", "reuse_blocked_memory_backend_degraded", "reuse_blocked_candidate_intent_unknown", "reuse_blocked_query_intent_unknown"]
+    },
+    "max_latency_seconds": 30
   }
 ]

@@ -1,10 +1,9 @@
-# S-Matrix - Apache Doris 4.0 Docker Compose 配置
-# 简化版本：1 FE + 1 BE 用于开发测试
+# S-Matrix - Apache Doris 4.0 Docker Compose
+# Simplified topology: 1 FE + 1 BE for local development and integration.
 
 services:
-  # Frontend (FE) - 元数据管理和查询协调
   smatrix-fe:
-    image: apache/doris:fe-4.0.0
+    image: apache/doris:fe-4.0.5
     container_name: smatrix-fe
     hostname: smatrix-fe
     restart: always
@@ -12,9 +11,9 @@ services:
       - FE_SERVERS=fe1:192.168.100.2:9010
       - FE_ID=1
     ports:
-      - "38030:8030"   # HTTP 端口 - Web UI
-      - "39030:9030"   # MySQL 协议端口 - 客户端连接
-      - "39010:9010"   # FE 内部通信端口
+      - "38030:8030" # FE HTTP
+      - "39030:9030" # FE MySQL
+      - "39010:9010" # FE internal communication
     volumes:
       - ./data/fe/doris-meta:/opt/apache-doris/fe/doris-meta
       - ./data/fe/log:/opt/apache-doris/fe/log
@@ -28,24 +27,26 @@ services:
       retries: 10
       start_period: 120s
 
-  # Backend (BE) - 数据存储和查询执行
   smatrix-be:
-    image: apache/doris:be-4.0.0
+    image: apache/doris:be-4.0.5
     container_name: smatrix-be
     hostname: smatrix-be
     restart: always
+    entrypoint:
+      - /opt/apache-doris/be_entrypoint.sh
+      - smatrix-fe
     depends_on:
       smatrix-fe:
         condition: service_healthy
     environment:
-      - FE_SERVERS=fe1:192.168.100.2:9010
-      - BE_ADDR=192.168.100.3:9050
+      - HOST_TYPE=FQDN
+      - SKIP_CHECK_ULIMIT=true
     ports:
-      - "38040:8040"   # BE HTTP 端口
-      - "39050:9050"   # BE 心跳端口
-      - "39060:9060"   # BE Thrift 端口
+      - "38040:8040" # BE HTTP
+      - "39050:9050" # BE heartbeat
+      - "39060:9060" # BE thrift
     volumes:
-      - ./data/be/storage:/opt/apache-doris/be/storage
+      - doris_be_storage:/opt/apache-doris/be/storage
       - ./data/be/log:/opt/apache-doris/be/log
     networks:
       smatrix-network:
@@ -57,7 +58,6 @@ services:
       retries: 10
       start_period: 120s
 
-  # API Gateway
   smatrix-api:
     build: ./doris-api
     container_name: smatrix-api
@@ -85,9 +85,17 @@ services:
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       - SMATRIX_API_KEY=${SMATRIX_API_KEY}
       - SMATRIX_CORS_ORIGINS=${SMATRIX_CORS_ORIGINS:-http://localhost:35173}
+      - DC_NLQ_DEFAULT_KERNEL=${DC_NLQ_DEFAULT_KERNEL:-auto}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/health', timeout=5).read()"
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
-  # Frontend Web UI
   smatrix-frontend:
     build:
       context: ./doris-frontend
@@ -102,7 +110,16 @@ services:
       smatrix-network:
         ipv4_address: 192.168.100.5
     depends_on:
-      - smatrix-api
+      smatrix-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O- http://127.0.0.1/ >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
 
 networks:
   smatrix-network:
@@ -111,3 +128,7 @@ networks:
       config:
         - subnet: 192.168.100.0/24
           gateway: 192.168.100.1
+
+volumes:
+  doris_be_storage:
+    name: doris_be_storage

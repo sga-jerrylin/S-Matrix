@@ -30,3 +30,18 @@ test('extractApiErrorMessage returns string detail when present', () => {
 
   assert.equal(extractApiErrorMessage(error), 'system tables cannot be deleted via this API');
 });
+
+test('extractApiErrorMessage returns nested detail.message when present', () => {
+  const error = {
+    response: {
+      data: {
+        detail: {
+          message: 'Packet sequence number wrong - got 80 expected 0',
+        },
+      },
+    },
+    message: 'Request failed with status code 500',
+  };
+
+  assert.equal(extractApiErrorMessage(error), 'Packet sequence number wrong - got 80 expected 0');
+});

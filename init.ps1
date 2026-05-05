@@ -1,140 +1,240 @@
-# S-Matrix 初始化脚本 (Windows PowerShell)
-# 用于首次部署或重新部署时自动完成所有配置
-
 param(
-    [switch]$Reset  # 使用 -Reset 参数清除所有数据重新开始
+    [switch]$Reset,
+    [switch]$Yes
 )
 
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  S-Matrix 自动部署脚本" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-
-# 进入项目目录
+$ErrorActionPreference = 'Stop'
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptPath
 
-# 如果指定了 Reset 参数，清除所有数据
-if ($Reset) {
-    Write-Host "[警告] 即将清除所有数据..." -ForegroundColor Yellow
-    $confirm = Read-Host "确定要清除所有数据吗？(y/N)"
-    if ($confirm -eq 'y' -or $confirm -eq 'Y') {
-        Write-Host "停止并删除容器..." -ForegroundColor Yellow
-        docker compose down -v
-        Write-Host "清除数据目录..." -ForegroundColor Yellow
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./data/fe/doris-meta/*"
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./data/fe/log/*"
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./data/be/storage/*"
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./data/be/log/*"
-        Write-Host "数据已清除" -ForegroundColor Green
-    } else {
-        Write-Host "取消清除操作" -ForegroundColor Gray
-    }
-}
+$CanonicalBackendHost = "smatrix-be"
+$CanonicalBackendPort = "9050"
 
-# 1. 停止现有服务
-Write-Host ""
-Write-Host "[1/5] 停止现有服务..." -ForegroundColor Blue
-docker compose down
+function Wait-ContainerHealth {
+    param(
+        [Parameter(Mandatory = $true)][string]$Service,
+        [int]$Attempts = 120,
+        [int]$SleepSeconds = 5
+    )
 
-# 2. 创建数据目录
-Write-Host ""
-Write-Host "[2/5] 确保数据目录存在..." -ForegroundColor Blue
-New-Item -ItemType Directory -Force -Path "./data/fe/doris-meta" | Out-Null
-New-Item -ItemType Directory -Force -Path "./data/fe/log" | Out-Null
-New-Item -ItemType Directory -Force -Path "./data/be/storage" | Out-Null
-New-Item -ItemType Directory -Force -Path "./data/be/log" | Out-Null
-Write-Host "  ✓ 数据目录已创建" -ForegroundColor Green
-
-# 3. 启动服务
-Write-Host ""
-Write-Host "[3/5] 启动 Docker 服务..." -ForegroundColor Blue
-docker compose up -d --build
-
-# 4. 等待服务启动
-Write-Host ""
-Write-Host "[4/5] 等待服务启动完成..." -ForegroundColor Blue
-Write-Host "  这可能需要 2-3 分钟，请耐心等待..." -ForegroundColor Gray
-
-$maxAttempts = 60
-$attempt = 0
-$feReady = $false
-$beReady = $false
-
-while ($attempt -lt $maxAttempts -and (-not $feReady -or -not $beReady)) {
-    Start-Sleep -Seconds 5
-    $attempt++
-    
-    # 检查 FE 状态
-    if (-not $feReady) {
-        $feHealth = docker inspect --format='{{.State.Health.Status}}' smatrix-fe 2>$null
-        if ($feHealth -eq "healthy") {
-            Write-Host "  ✓ FE 服务已就绪" -ForegroundColor Green
-            $feReady = $true
-        } else {
-            Write-Host "  · 等待 FE 启动... ($attempt/$maxAttempts)" -ForegroundColor Gray
+    for ($i = 1; $i -le $Attempts; $i++) {
+        $status = docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}' $Service 2>$null
+        if ($status -eq 'healthy') {
+            return
         }
-    }
-    
-    # 检查 BE 状态
-    if ($feReady -and -not $beReady) {
-        $beHealth = docker inspect --format='{{.State.Health.Status}}' smatrix-be 2>$null
-        if ($beHealth -eq "healthy") {
-            Write-Host "  ✓ BE 服务已就绪" -ForegroundColor Green
-            $beReady = $true
-        } else {
-            Write-Host "  · 等待 BE 启动... ($attempt/$maxAttempts)" -ForegroundColor Gray
+        if ($status -eq 'unhealthy') {
+            Write-Host "Service is unhealthy: $Service" -ForegroundColor Red
+            docker compose logs --no-color $Service
+            exit 1
         }
+        Start-Sleep -Seconds $SleepSeconds
     }
-}
 
-if (-not $feReady -or -not $beReady) {
-    Write-Host ""
-    Write-Host "[错误] 服务启动超时，请检查日志：" -ForegroundColor Red
-    Write-Host "  docker compose logs smatrix-fe smatrix-be" -ForegroundColor Yellow
+    Write-Host "Timed out waiting for healthy service: $Service" -ForegroundColor Red
     exit 1
 }
 
-# 5. 注册 BE 节点
-Write-Host ""
-Write-Host "[5/5] 注册 BE 节点到集群..." -ForegroundColor Blue
+function Wait-FeMysqlReady {
+    param(
+        [int]$Attempts = 60,
+        [int]$SleepSeconds = 2
+    )
 
-# 等待额外时间确保服务完全就绪
-Start-Sleep -Seconds 10
+    for ($i = 1; $i -le $Attempts; $i++) {
+        $exitCode = 1
+        try {
+            docker compose exec -T smatrix-fe mysql -hsmatrix-fe -P9030 -uroot -e "SELECT 1;" 2>$null | Out-Null
+            $exitCode = $LASTEXITCODE
+        } catch {
+            $exitCode = 1
+        }
+        if ($exitCode -eq 0) {
+            return
+        }
+        Start-Sleep -Seconds $SleepSeconds
+    }
 
-# 检查 BE 是否已注册
-$beCheck = docker exec smatrix-fe mysql -h127.0.0.1 -P9030 -uroot -e "SHOW BACKENDS;" 2>$null
-if ($beCheck -match "172.30.0.3") {
-    Write-Host "  ✓ BE 节点已存在，跳过注册" -ForegroundColor Green
-} else {
-    # 注册 BE 节点
-    docker exec smatrix-fe mysql -h127.0.0.1 -P9030 -uroot -e "ALTER SYSTEM ADD BACKEND '172.30.0.3:9050';"
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "  ✓ BE 节点注册成功" -ForegroundColor Green
-    } else {
-        Write-Host "  ! BE 节点可能已存在或注册失败" -ForegroundColor Yellow
+    Write-Host "Timed out waiting for FE MySQL endpoint readiness (smatrix-fe:9030 inside smatrix-fe)" -ForegroundColor Red
+    exit 1
+}
+
+function Get-BackendsRaw {
+    try {
+        $output = docker compose exec -T smatrix-fe mysql -hsmatrix-fe -P9030 -uroot --batch --skip-column-names -e "SHOW BACKENDS;" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            return $null
+        }
+        return $output
+    } catch {
+        return $null
     }
 }
 
-# 等待 BE 上线
-Write-Host "  等待 BE 节点上线..." -ForegroundColor Gray
-Start-Sleep -Seconds 15
+function Write-RecoveryHint {
+    Write-Host "Recovery steps:" -ForegroundColor Yellow
+    Write-Host "  1) .\init.ps1 -Reset -Yes" -ForegroundColor Yellow
+    Write-Host "  2) .\init.ps1" -ForegroundColor Yellow
+}
 
-# 显示最终状态
+function Test-SingleCanonicalBackend {
+    param([string[]]$BackendRows)
+
+    $rows = @($BackendRows | Where-Object { $_ -and $_.Trim() })
+    if ($rows.Count -gt 1) {
+        Write-Host "Detected duplicate Doris backends. Expected exactly one backend ($CanonicalBackendHost`:$CanonicalBackendPort)." -ForegroundColor Red
+        $rows | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+        Write-RecoveryHint
+        return 1
+    }
+
+    if ($rows.Count -eq 0) {
+        return 2
+    }
+
+    $columns = $rows[0] -split "`t"
+    if ($columns.Count -lt 10) {
+        Write-Host "Unable to parse SHOW BACKENDS output: $($rows[0])" -ForegroundColor Red
+        Write-RecoveryHint
+        return 1
+    }
+
+    $backendHost = $columns[1].Trim()
+    $heartbeatPort = $columns[2].Trim()
+    $alive = $columns[9].Trim().ToLowerInvariant()
+    if ($backendHost -ne $CanonicalBackendHost -or $heartbeatPort -ne $CanonicalBackendPort) {
+        Write-Host "Detected stale Doris backend: $backendHost`:$heartbeatPort. Expected $CanonicalBackendHost`:$CanonicalBackendPort." -ForegroundColor Red
+        $rows | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+        Write-RecoveryHint
+        return 1
+    }
+    if ($alive -ne "true") {
+        Write-Host "Canonical Doris backend is not alive: $backendHost`:$heartbeatPort (Alive=$alive)." -ForegroundColor Red
+        $rows | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+        Write-RecoveryHint
+        return 1
+    }
+
+    return 0
+}
+
+function Ensure-BackendRegistered {
+    param(
+        [int]$Attempts = 20,
+        [int]$SleepSeconds = 2
+    )
+
+    for ($i = 1; $i -le $Attempts; $i++) {
+        $backendRaw = Get-BackendsRaw
+        if ($null -eq $backendRaw) {
+            Start-Sleep -Seconds $SleepSeconds
+            continue
+        }
+
+        $backendRows = @($backendRaw -split "`r?`n" | Where-Object { $_.Trim() })
+        $status = Test-SingleCanonicalBackend -BackendRows $backendRows
+        if ($status -eq 0) {
+            Write-Host "Backend already canonical: $CanonicalBackendHost`:$CanonicalBackendPort" -ForegroundColor Green
+            return
+        }
+        if ($status -eq 1) {
+            exit 1
+        }
+
+        $addExitCode = 1
+        try {
+            docker compose exec -T smatrix-fe mysql -hsmatrix-fe -P9030 -uroot -e "ALTER SYSTEM ADD BACKEND '$CanonicalBackendHost`:$CanonicalBackendPort';" 2>$null | Out-Null
+            $addExitCode = $LASTEXITCODE
+        } catch {
+            $addExitCode = 1
+        }
+
+        if ($addExitCode -eq 0) {
+            Write-Host "Registered $CanonicalBackendHost`:$CanonicalBackendPort" -ForegroundColor Green
+            Start-Sleep -Seconds $SleepSeconds
+            $backendRaw = Get-BackendsRaw
+            if ($null -eq $backendRaw) {
+                Write-Host "Backend registration succeeded but backend verification could not be fetched." -ForegroundColor Red
+                Write-RecoveryHint
+                exit 1
+            }
+            $backendRows = @($backendRaw -split "`r?`n" | Where-Object { $_.Trim() })
+            $status = Test-SingleCanonicalBackend -BackendRows $backendRows
+            if ($status -eq 0) {
+                return
+            }
+            exit 1
+        }
+
+        Start-Sleep -Seconds $SleepSeconds
+    }
+
+    Write-Host "Failed to ensure backend $CanonicalBackendHost`:$CanonicalBackendPort within retry window" -ForegroundColor Red
+    exit 1
+}
+
+if ($Reset) {
+    Write-Host "[warn] Reset requested, clearing containers and local data" -ForegroundColor Yellow
+    if (-not $Yes) {
+        $confirm = Read-Host "Confirm data removal? [y/N]"
+        if ($confirm -ne 'y' -and $confirm -ne 'Y') {
+            Write-Host "Reset cancelled" -ForegroundColor Gray
+            exit 1
+        }
+    }
+
+    docker compose down -v --remove-orphans
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./data/fe/doris-meta/*"
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./data/fe/log/*"
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "./data/be/log/*"
+    Write-Host "Data directories cleared" -ForegroundColor Green
+}
+
+Write-Host "[1/4] Stopping existing services..." -ForegroundColor Cyan
+docker compose down --remove-orphans
+
+Write-Host "[2/4] Ensuring local data directories exist..." -ForegroundColor Cyan
+New-Item -ItemType Directory -Force -Path "./data/fe/doris-meta" | Out-Null
+New-Item -ItemType Directory -Force -Path "./data/fe/log" | Out-Null
+New-Item -ItemType Directory -Force -Path "./data/be/log" | Out-Null
+
+Write-Host "[3/4] Starting Docker services..." -ForegroundColor Cyan
+docker compose up -d --build --remove-orphans smatrix-fe smatrix-be
+$coreUpExitCode = $LASTEXITCODE
+if ($coreUpExitCode -ne 0) {
+    Write-Host "docker compose up for FE/BE returned exit code $coreUpExitCode; continuing with explicit health checks." -ForegroundColor Yellow
+}
+
+Write-Host "[4/4] Waiting for Doris FE/BE and registering canonical backend..." -ForegroundColor Cyan
+Wait-ContainerHealth -Service smatrix-fe
+Wait-ContainerHealth -Service smatrix-be
+Wait-FeMysqlReady
+Ensure-BackendRegistered
+
+Start-Sleep -Seconds 10
+
+Write-Host "[4.5/4] Starting API and frontend after Doris is stable..." -ForegroundColor Cyan
+docker compose up -d smatrix-api smatrix-frontend
+$appUpExitCode = $LASTEXITCODE
+if ($appUpExitCode -ne 0) {
+    Write-Host "docker compose up for API/frontend failed with exit code $appUpExitCode" -ForegroundColor Red
+    exit $appUpExitCode
+}
+Wait-ContainerHealth -Service smatrix-api
+Wait-ContainerHealth -Service smatrix-frontend
+
+Write-Host "Running runtime smoke checks..." -ForegroundColor Cyan
+python doris-api/dc.py smoke
+
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  部署完成！" -ForegroundColor Green
+Write-Host "  Deployment complete" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "服务状态：" -ForegroundColor White
-docker compose ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
+docker compose ps
 Write-Host ""
-Write-Host "BE 节点状态：" -ForegroundColor White
-docker exec smatrix-fe mysql -h127.0.0.1 -P9030 -uroot -e "SHOW BACKENDS\G" 2>$null | Select-String -Pattern "Alive|Host|HeartbeatPort"
-Write-Host ""
-Write-Host "访问地址：" -ForegroundColor White
+Write-Host "Access URLs:" -ForegroundColor White
 Write-Host "  - Web UI:    http://localhost:35173" -ForegroundColor Cyan
 Write-Host "  - Doris UI:  http://localhost:38030" -ForegroundColor Cyan
 Write-Host "  - API:       http://localhost:38018" -ForegroundColor Cyan
+Write-Host "  - Health:    http://localhost:38018/api/health" -ForegroundColor Cyan
 Write-Host "  - MySQL:     mysql -h127.0.0.1 -P39030 -uroot" -ForegroundColor Cyan
-Write-Host ""

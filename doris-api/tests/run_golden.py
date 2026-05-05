@@ -6,6 +6,10 @@ import json
 import sys
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from golden_runner import build_headers, run_cases, summarize_results
 
 
@@ -17,6 +21,8 @@ def parse_args() -> argparse.Namespace:
         "--cases",
         default=str(Path(__file__).with_name("golden_queries.json")),
     )
+    parser.add_argument("--resource-name", default="")
+    parser.add_argument("--kernel", default="")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--min-pass-rate", type=float, default=1.0)
     parser.add_argument("--min-passed", type=int, default=None)
@@ -28,6 +34,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     cases = json.loads(Path(args.cases).read_text(encoding="utf-8"))
+    if args.resource_name:
+        for case in cases:
+            if isinstance(case, dict):
+                case.setdefault("resource_name", args.resource_name)
+    if args.kernel:
+        for case in cases:
+            if isinstance(case, dict):
+                case.setdefault("kernel", args.kernel)
     headers = build_headers(args.api_key)
     results = run_cases(cases, base_url=args.base_url, headers=headers, timeout=args.timeout)
     summary = summarize_results(

@@ -312,3 +312,69 @@ def test_natural_query_route_limits_planner_scope_to_selected_tables(monkeypatch
 
     assert response.status_code == 200
     assert [row["table_name"] for row in seen["tables_context"]] == ["activities"]
+
+
+def test_planner_routes_order_count_to_orders_over_order_items():
+    from planner_agent import PlannerAgent
+
+    planner = PlannerAgent(
+        tables_context=[
+            {"table_name": "order_items", "description": "订单商品明细"},
+            {"table_name": "orders", "description": "订单主表"},
+            {"table_name": "order_payment_trade", "description": "支付流水"},
+        ]
+    )
+
+    plan = planner.plan("查询订单总数")
+
+    assert plan["tables"] == ["orders"]
+    assert plan["fallback_used"] is False
+
+
+def test_planner_routes_product_detail_question_to_order_items():
+    from planner_agent import PlannerAgent
+
+    planner = PlannerAgent(
+        tables_context=[
+            {"table_name": "orders", "description": "订单主表"},
+            {"table_name": "order_items", "description": "订单商品明细"},
+        ]
+    )
+
+    plan = planner.plan("查询商品明细中销量最高的10个商品")
+
+    assert plan["tables"] == ["order_items"]
+    assert plan["fallback_used"] is False
+
+
+def test_planner_routes_payment_question_to_order_payment_trade():
+    from planner_agent import PlannerAgent
+
+    planner = PlannerAgent(
+        tables_context=[
+            {"table_name": "orders", "description": "订单主表"},
+            {"table_name": "order_payment_trade", "description": "支付流水"},
+            {"table_name": "order_items", "description": "订单明细"},
+        ]
+    )
+
+    plan = planner.plan("最近7天订单每天的付款金额是多少")
+
+    assert plan["tables"] == ["order_payment_trade"]
+    assert plan["fallback_used"] is False
+
+
+def test_planner_fallback_prefers_orders_not_stock_out():
+    from planner_agent import PlannerAgent
+
+    planner = PlannerAgent(
+        tables_context=[
+            {"table_name": "warehouse_stock_out_items", "description": "出库明细"},
+            {"table_name": "orders", "description": "订单主表"},
+        ]
+    )
+
+    plan = planner.plan("这是一个无法识别的随机问题")
+
+    assert plan["tables"] == ["orders"]
+    assert plan["fallback_used"] is True

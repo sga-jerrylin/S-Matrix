@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timedelta
 import httpx
 import pytest
 
@@ -25,6 +27,32 @@ class RecordingDB:
     def execute_update(self, sql, params=None):
         self.updates.append((sql, params))
         return 1
+
+
+STABLE_REPORT_FIELDS = {
+    "summary",
+    "insights",
+    "top_insights",
+    "anomalies",
+    "recommendations",
+    "action_items",
+    "insight_count",
+    "anomaly_count",
+}
+
+
+def assert_stable_report_fields(payload):
+    missing = STABLE_REPORT_FIELDS.difference(payload.keys())
+    assert not missing
+    assert isinstance(payload["summary"], str)
+    assert isinstance(payload["insights"], list)
+    assert isinstance(payload["top_insights"], list)
+    assert isinstance(payload["anomalies"], list)
+    assert isinstance(payload["recommendations"], list)
+    assert isinstance(payload["action_items"], list)
+    assert payload["insight_count"] == len(payload["insights"])
+    assert payload["anomaly_count"] == len(payload["anomalies"])
+    assert payload["top_insights"] == payload["insights"][: len(payload["top_insights"])]
 
 
 def test_init_tables_creates_reports_table():
@@ -296,6 +324,158 @@ def test_replay_from_history_reuses_saved_query(monkeypatch):
     assert report["history_id"] == "history-1"
     assert report["trigger_type"] == "history_replay"
     assert "current data" in report["note"].lower()
+
+
+def test_build_expert_report_contains_stable_contract_fields():
+    agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "key"})
+
+    report = agent._build_expert_report(
+        table_names=["sales"],
+        profile={"row_count": 120, "sampled": False, "sample_size": 120, "columns": {}},
+        compressed_history=[
+            {
+                "round": 3,
+                "strategist_output": {
+                    "summary": "Revenue stayed stable across monitored windows.",
+                    "findings": [
+                        {"category": "Revenue stability", "description": "Revenue variance is within tolerance."},
+                        {"category": "Demand mix", "description": "Top segment share stayed within baseline."},
+                    ],
+                    "anomalies": [{"category": "Spike scan", "description": "No severe outlier spike found."}],
+                    "recommendations": ["Monitor weekly variance thresholds."],
+                    "limitations": [],
+                    "root_causes": [],
+                    "confidence_overall": 0.9,
+                    "continue": False,
+                },
+                "results": [],
+            }
+        ],
+        reasoning_traces=[],
+        all_step_results=[{"success": True}],
+        trigger_type="table_analysis",
+        started_at=0.0,
+    )
+
+    assert_stable_report_fields(report)
+    assert report["insight_count"] == 2
+    assert report["anomaly_count"] == 1
+    assert len(report["top_insights"]) == 2
+    assert len(report["action_items"]) == 1
+
+
+def test_replay_list_detail_latest_stay_consistent_with_stable_contract(monkeypatch):
+    class ContractDB(RecordingDB):
+        def __init__(self):
+            super().__init__()
+            self.saved_reports = {}
+
+        def execute_query(self, sql, params=None):
+            self.queries.append((sql, params))
+            if "FROM `_sys_query_history`" in sql:
+                return [
+                    {
+                        "id": "history-1",
+                        "question": "How many sales?",
+                        "sql": "SELECT COUNT(*) AS total FROM `sales`",
+                        "table_names": "sales",
+                    }
+                ]
+            if "SELECT `id`, `table_names`" in sql and "FROM `_sys_analysis_reports`" in sql:
+                reports = list(self.saved_reports.values())
+                if "FIND_IN_SET" in sql and params:
+                    table_filter = params[0]
+                    reports = [
+                        item
+                        for item in reports
+                        if table_filter in str(item.get("table_names", "")).split(",")
+                    ]
+                rows = [
+                    {
+                        "id": item["id"],
+                        "table_names": item["table_names"],
+                        "trigger_type": item["trigger_type"],
+                        "depth": item["depth"],
+                        "summary": item["summary"],
+                        "insight_count": item["insight_count"],
+                        "anomaly_count": item["anomaly_count"],
+                        "failed_step_count": item["failed_step_count"],
+                        "status": item["status"],
+                        "error_message": item["error_message"],
+                        "duration_ms": item["duration_ms"],
+                        "created_at": item["created_at"],
+                    }
+                    for item in reports
+                ]
+                return rows
+            if "SELECT `report_json` FROM `_sys_analysis_reports` WHERE `id` = %s" in sql:
+                report = self.saved_reports.get((params or [None])[0])
+                return [{"report_json": report}] if report else []
+            if "SELECT `report_json`" in sql and "FIND_IN_SET" in sql:
+                table_name = (params or [None])[0]
+                matches = [
+                    item for item in self.saved_reports.values() if table_name in str(item.get("table_names", "")).split(",")
+                ]
+                return [{"report_json": matches[-1]}] if matches else []
+            return []
+
+        def execute_update(self, sql, params=None):
+            self.updates.append((sql, params))
+            if "INSERT INTO `_sys_analysis_reports`" in sql and params:
+                payload = params[7]
+                report = json.loads(payload) if isinstance(payload, str) else payload
+                self.saved_reports[report["id"]] = report
+            return 1
+
+    db = ContractDB()
+    agent = AnalystAgent(db, lambda **kwargs: {"api_key": "key", "model": "model", "base_url": "https://example.com"})
+    monkeypatch.setattr(agent, "_profile_table", lambda table_name: {"row_count": 10, "sampled": False, "sample_size": 10, "columns": {}})
+    monkeypatch.setattr(
+        agent,
+        "_execute_with_repair",
+        lambda sql, question_context, api_config: ([{"total": 10}], sql, True, None),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_generate_insights",
+        lambda step_results, profile, api_config: {
+            "summary": "Replay contract summary.",
+            "insights": [{"title": "Current total", "detail": "10 rows"}],
+            "anomalies": [],
+            "recommendations": ["Track weekly drift."],
+        },
+    )
+
+    original_build_report = agent._build_report
+
+    def patched_build_report(**kwargs):
+        report = original_build_report(**kwargs)
+        report["top_insights"] = list(report.get("insights") or [])[:3]
+        report["action_items"] = [
+            {"title": f"Action item {idx + 1}", "detail": item}
+            for idx, item in enumerate(report.get("recommendations") or [])
+        ][:3]
+        return report
+
+    monkeypatch.setattr(agent, "_build_report", patched_build_report)
+
+    replay = agent.replay_from_history("history-1", resource_name="Deepseek")
+    reports = agent.list_reports(table_name="sales")
+    detail = agent.get_report(replay["id"])
+    latest = agent.get_latest_report("sales")
+
+    assert_stable_report_fields(replay)
+    assert_stable_report_fields(detail)
+    assert_stable_report_fields(latest)
+    for field in STABLE_REPORT_FIELDS:
+        assert replay[field] == detail[field] == latest[field]
+
+    assert reports["count"] == 1
+    row = reports["reports"][0]
+    assert row["id"] == replay["id"]
+    assert row["summary"] == replay["summary"]
+    assert row["insight_count"] == replay["insight_count"]
+    assert row["anomaly_count"] == replay["anomaly_count"]
 
 
 def test_build_strategist_config_uses_default_provider_without_resource(monkeypatch):
@@ -1045,6 +1225,15 @@ def test_get_report_and_latest_report_hide_reasoning_by_default():
                 "success": True,
                 "id": "report-1",
                 "table_names": "sales",
+                "depth": "expert",
+                "summary": "Revenue trend is stable.",
+                "insights": [{"title": "Revenue", "detail": "Revenue is stable."}],
+                "top_insights": [{"title": "Revenue", "detail": "Revenue is stable."}],
+                "anomalies": [],
+                "recommendations": ["Continue monitoring trend stability."],
+                "action_items": [{"title": "Action item 1", "detail": "Review weekly KPI baseline."}],
+                "insight_count": 1,
+                "anomaly_count": 0,
                 "reasoning_traces": [{"round": 1, "trace": "secret"}],
             }
             return [{"report_json": payload}]
@@ -1056,8 +1245,11 @@ def test_get_report_and_latest_report_hide_reasoning_by_default():
     latest = agent.get_latest_report("sales")
 
     assert "reasoning_traces" not in detail
+    assert_stable_report_fields(detail)
     assert with_reasoning["reasoning_traces"][0]["trace"] == "secret"
+    assert_stable_report_fields(with_reasoning)
     assert "reasoning_traces" not in latest
+    assert_stable_report_fields(latest)
 
 
 def test_get_report_hydrates_fixed_expert_sections_for_legacy_reports():
@@ -1097,3 +1289,356 @@ def test_get_report_hydrates_fixed_expert_sections_for_legacy_reports():
     assert "优先补齐主数据字段" in report["action_items"][0]["detail"]
     assert report["action_items"][1]["title"] == "供应链韧性"
     assert report["recommendations"][1] == "供应链韧性：建立第二供应源。"
+
+
+def test_list_reports_summary_contract_includes_stable_fields():
+    class ListReportDB(RecordingDB):
+        def execute_query(self, sql, params=None):
+            payload = {
+                "success": True,
+                "id": "report-1",
+                "table_names": "sales",
+                "trigger_type": "table_analysis",
+                "depth": "quick",
+                "summary": "Sales trend is stable.",
+                "insights": [{"title": "Sales trend", "detail": "Week-over-week remains stable."}],
+                "top_insights": [{"title": "Sales trend", "detail": "Week-over-week remains stable."}],
+                "anomalies": [],
+                "recommendations": ["Keep monitoring seasonality."],
+                "action_items": [{"title": "Action item 1", "detail": "Review weekly variance."}],
+                "insight_count": 1,
+                "anomaly_count": 0,
+                "status": "completed",
+                "failed_step_count": 0,
+                "duration_ms": 15,
+                "created_at": "2026-04-19 10:00:00",
+            }
+            return [
+                {
+                    "id": "report-1",
+                    "table_names": "sales",
+                    "trigger_type": "table_analysis",
+                    "depth": "quick",
+                    "summary": "Sales trend is stable.",
+                    "insight_count": 1,
+                    "anomaly_count": 0,
+                    "failed_step_count": 0,
+                    "status": "completed",
+                    "error_message": None,
+                    "duration_ms": 15,
+                    "created_at": "2026-04-19 10:00:00",
+                    "report_json": json.dumps(payload, ensure_ascii=False),
+                }
+            ]
+
+    agent = AnalystAgent(ListReportDB(), lambda **kwargs: {"api_key": "key"})
+    response = agent.list_reports(table_name="sales", limit=10, offset=0)
+
+    assert response["success"] is True
+    assert response["contract_version"] == "insight.report.summary.v1"
+    assert response["count"] == 1
+    report = response["reports"][0]
+    assert report["contract_version"] == "insight.report.summary.v1"
+    assert_stable_report_fields(report)
+    assert report["id"] == "report-1"
+    assert report["summary"] == "Sales trend is stable."
+
+
+def test_get_report_summary_returns_summary_contract_surface():
+    class SummaryReportDB(RecordingDB):
+        def execute_query(self, sql, params=None):
+            payload = {
+                "success": True,
+                "id": "report-1",
+                "table_names": "sales",
+                "trigger_type": "history_replay",
+                "depth": "quick",
+                "history_id": "history-1",
+                "summary": "Replay summary",
+                "insights": [{"title": "Replay insight", "detail": "Replay tracks latest drift."}],
+                "top_insights": [{"title": "Replay insight", "detail": "Replay tracks latest drift."}],
+                "anomalies": [],
+                "recommendations": ["Track drift daily."],
+                "action_items": [{"title": "Action item 1", "detail": "Pin replay baseline."}],
+                "insight_count": 1,
+                "anomaly_count": 0,
+                "status": "completed",
+                "failed_step_count": 0,
+                "duration_ms": 8,
+                "created_at": "2026-04-19 10:10:00",
+            }
+            return [{"report_json": payload}]
+
+    agent = AnalystAgent(SummaryReportDB(), lambda **kwargs: {"api_key": "key"})
+    summary = agent.get_report_summary("report-1")
+
+    assert summary["success"] is True
+    assert summary["contract_version"] == "insight.report.summary.v1"
+    assert_stable_report_fields(summary)
+    assert summary["id"] == "report-1"
+    assert summary["history_id"] == "history-1"
+    assert summary["trigger_type"] == "history_replay"
+
+
+def test_forecast_metric_returns_mvp_payload_with_backtest():
+    class ForecastDB(RecordingDB):
+        def execute_query(self, sql, params=None):
+            self.queries.append((sql, params))
+            if "FROM `orders`" not in sql:
+                return []
+            rows = []
+            base = datetime(2026, 1, 1)
+            for i in range(30):
+                rows.append(
+                    {
+                        "ts": (base + timedelta(days=i)).strftime("%Y-%m-%d %H:%M:%S"),
+                        "metric_value": float(100 + (i % 7) * 3),
+                    }
+                )
+            return rows
+
+    agent = AnalystAgent(ForecastDB(), lambda **kwargs: {"api_key": "key"})
+
+    payload = agent.forecast_metric(
+        "orders.sum(amount)@order_date",
+        granularity="day",
+        horizon_steps=7,
+        start_at="2026-01-01T00:00:00",
+        end_at="2026-02-01T00:00:00",
+        filters={"region": "east"},
+    )
+
+    assert payload["success"] is True
+    assert payload["status"] == "completed"
+    assert payload["contract_version"] == "insight.forecast.result.v1"
+    assert payload["forecast_id"]
+    assert payload["metric_key"] == "orders.sum(amount)@order_date"
+    assert payload["horizon"]["steps"] == 7
+    assert payload["horizon"]["unit"] == "day"
+    assert len(payload["points"]) == 7
+    assert payload["points"][0]["ts"]
+    assert payload["points"][0]["lower"] <= payload["points"][0]["value"] <= payload["points"][0]["upper"]
+    assert payload["backtest_summary"]["status"] == "ok"
+    assert payload["backtest_summary"]["mae"] is not None
+    assert payload["model_info"]["status"] == "ready"
+    assert payload["model_info"]["aggregation"] == "sum"
+
+
+def test_forecast_metric_returns_stable_failure_on_invalid_metric_key():
+    agent = AnalystAgent(RecordingDB(), lambda **kwargs: {"api_key": "key"})
+
+    payload = agent.forecast_metric("invalid.metric", granularity="day", horizon_steps=3)
+
+    assert payload["success"] is False
+    assert payload["status"] == "failed"
+    assert payload["contract_version"] == "insight.forecast.result.v1"
+    assert payload["points"] == []
+    assert payload["error"]["code"] == "invalid_input"
+    assert payload["backtest_summary"]["status"] == "unavailable"
+    assert payload["model_info"]["status"] == "failed"
+
+
+def test_forecast_metric_returns_stable_failure_on_insufficient_history():
+    class ShortHistoryDB(RecordingDB):
+        def execute_query(self, sql, params=None):
+            self.queries.append((sql, params))
+            if "FROM `orders`" not in sql:
+                return []
+            return [
+                {"ts": "2026-01-01 00:00:00", "metric_value": 10.0},
+                {"ts": "2026-01-02 00:00:00", "metric_value": 12.0},
+            ]
+
+    agent = AnalystAgent(ShortHistoryDB(), lambda **kwargs: {"api_key": "key"})
+
+    payload = agent.forecast_metric("orders.sum(amount)@order_date", granularity="day", horizon_steps=5)
+
+    assert payload["success"] is False
+    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "insufficient_history"
+    assert payload["points"] == []
+    assert payload["model_info"]["status"] == "failed"
+
+
+def test_registered_metric_id_can_be_forecasted_via_internal_metric_surface():
+    class InternalMetricProvider:
+        def __init__(self):
+            self.calls = []
+
+        def get_metric_definition(self, metric_key):
+            self.calls.append(("get_metric_definition", metric_key))
+            if metric_key != "gmv_total":
+                return None
+            return {
+                "metric_key": "gmv_total",
+                "display_name": "GMV Total",
+                "table_name": "orders",
+                "time_field": "order_date",
+                "value_field": "amount",
+                "aggregation": "sum",
+                "default_grain": "day",
+                "dimensions": ["region"],
+                "availability": {
+                    "forecast_ready": True,
+                    "blocking_reasons": [],
+                    "warnings": [],
+                },
+            }
+
+        def get_metric_series(
+            self,
+            metric_key,
+            *,
+            start_time=None,
+            end_time=None,
+            grain=None,
+            filters=None,
+            limit=None,
+        ):
+            self.calls.append(
+                ("get_metric_series", metric_key, start_time, end_time, grain, filters or {}, limit)
+            )
+            base = datetime(2026, 1, 1)
+            points = []
+            for i in range(24):
+                points.append(
+                    {
+                        "ts": (base + timedelta(days=i)).strftime("%Y-%m-%d"),
+                        "value": float(120 + (i % 6) * 4),
+                    }
+                )
+            return {"success": True, "points": points}
+
+    provider = InternalMetricProvider()
+    db = RecordingDB()
+    agent = AnalystAgent(db, lambda **kwargs: {"api_key": "key"})
+
+    payload = agent.forecast_metric(
+        "gmv_total",
+        granularity="day",
+        horizon_steps=7,
+        start_at="2026-01-01T00:00:00",
+        end_at="2026-02-15T00:00:00",
+        filters={"region": "east"},
+        metric_provider=provider,
+    )
+
+    assert payload["success"] is True
+    assert payload["status"] == "completed"
+    assert payload["metric_key"] == "gmv_total"
+    assert len(payload["points"]) == 7
+    assert payload["backtest_summary"]["status"] == "ok"
+    assert payload["model_info"]["status"] == "ready"
+    assert payload["model_info"]["aggregation"] == "sum"
+    assert payload["model_info"]["metric_source"] == "registered_metric"
+    assert provider.calls[0] == ("get_metric_definition", "gmv_total")
+    assert provider.calls[1][0] == "get_metric_series"
+    assert db.queries == []
+
+
+def test_non_numeric_arithmetic_metric_returns_stable_contract_input_failure():
+    class AvailabilityProvider:
+        def __init__(self):
+            self.calls = []
+
+        def get_metric_definition(self, metric_key):
+            self.calls.append(("get_metric_definition", metric_key))
+            return None
+
+        def evaluate_metric_availability(self, metric_definition):
+            self.calls.append(
+                (
+                    "evaluate_metric_availability",
+                    metric_definition.get("metric_key"),
+                    metric_definition.get("aggregation"),
+                    metric_definition.get("value_field"),
+                )
+            )
+            return {
+                "forecast_ready": False,
+                "blocking_reasons": [
+                    {
+                        "code": "value_field_not_numeric",
+                        "message": "value_field 'name' type 'VARCHAR(32)' is not numeric for aggregation 'sum'",
+                    }
+                ],
+                "warnings": [],
+            }
+
+    provider = AvailabilityProvider()
+    db = RecordingDB()
+    agent = AnalystAgent(db, lambda **kwargs: {"api_key": "key"})
+
+    payload = agent.forecast_metric(
+        "orders.sum(name)@order_date",
+        granularity="day",
+        horizon_steps=7,
+        metric_provider=provider,
+    )
+
+    assert payload["success"] is False
+    assert payload["status"] == "failed"
+    assert payload["points"] == []
+    assert payload["error"]["code"] == "metric_not_forecast_ready"
+    assert payload["error"]["code"] != "insufficient_history"
+    assert payload["error"]["details"]["blocking_reasons"][0]["code"] == "value_field_not_numeric"
+    assert payload["backtest_summary"]["status"] == "unavailable"
+    assert payload["model_info"]["status"] == "failed"
+    assert db.queries == []
+    assert provider.calls[0] == ("get_metric_definition", "orders.sum(name)@order_date")
+    assert provider.calls[1][0] == "evaluate_metric_availability"
+
+
+def test_legacy_metric_key_compatibility_path_still_enforces_availability_check():
+    class CompatProvider:
+        def __init__(self):
+            self.calls = []
+
+        def get_metric_definition(self, metric_key):
+            self.calls.append(("get_metric_definition", metric_key))
+            return None
+
+        def evaluate_metric_availability(self, metric_definition):
+            self.calls.append(
+                (
+                    "evaluate_metric_availability",
+                    metric_definition.get("metric_key"),
+                    metric_definition.get("aggregation"),
+                )
+            )
+            return {
+                "forecast_ready": True,
+                "blocking_reasons": [],
+                "warnings": [],
+            }
+
+    class CompatDB(RecordingDB):
+        def execute_query(self, sql, params=None):
+            self.queries.append((sql, params))
+            if "FROM `orders`" not in sql:
+                return []
+            base = datetime(2026, 1, 1)
+            rows = []
+            for i in range(20):
+                rows.append(
+                    {
+                        "ts": (base + timedelta(days=i)).strftime("%Y-%m-%d %H:%M:%S"),
+                        "metric_value": float(50 + i),
+                    }
+                )
+            return rows
+
+    provider = CompatProvider()
+    agent = AnalystAgent(CompatDB(), lambda **kwargs: {"api_key": "key"})
+
+    payload = agent.forecast_metric(
+        "orders.sum(amount)@order_date",
+        granularity="day",
+        horizon_steps=5,
+        metric_provider=provider,
+    )
+
+    assert payload["success"] is True
+    assert payload["status"] == "completed"
+    assert payload["model_info"]["metric_source"] == "legacy_expression_compat"
+    assert ("evaluate_metric_availability", "orders.sum(amount)@order_date", "sum") in provider.calls

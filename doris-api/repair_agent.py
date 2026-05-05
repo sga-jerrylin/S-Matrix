@@ -4,9 +4,8 @@ Auto-repair agent for failed SQL execution.
 import json
 from typing import Any, Dict, List, Optional
 
-import requests
-
 from db import DorisClient
+from llm_executor import LLMExecutor
 
 
 class RepairAgent:
@@ -32,36 +31,56 @@ class RepairAgent:
         ddl_list: Optional[List[str]] = None,
         api_config: Optional[Dict[str, Any]] = None,
     ) -> str:
-        api_key = (api_config or {}).get("api_key") or self.api_key
-        model = (api_config or {}).get("model") or self.model
-        base_url = (api_config or {}).get("base_url") or self.base_url
-        if not api_key:
-            raise ValueError("RepairAgent requires an API key")
+        runtime_config = dict(api_config or {})
+        runtime_config.setdefault("api_key", self.api_key)
+        runtime_config.setdefault("model", self.model)
+        runtime_config.setdefault("base_url", self.base_url)
+        runtime_config.setdefault("llm_execution_mode", "direct_api")
 
         prompt = self._build_prompt(question, failed_sql, error_message, ddl_list or [])
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You repair Apache Doris SQL. Return only the corrected SQL.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.0,
-                "max_tokens": 2000,
-            },
-            timeout=60,
+        executor = LLMExecutor(
+            doris_client=self.doris_client,
+            api_config=runtime_config,
         )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        content = executor.call(
+            prompt=prompt,
+            system_prompt="You repair Apache Doris SQL. Return only the corrected SQL.",
+            temperature=0.0,
+            max_tokens=2000,
+        )
         return self._clean_sql(content)
+
+    def repair_sql_with_trace(
+        self,
+        question: str,
+        failed_sql: str,
+        error_message: str,
+        ddl_list: Optional[List[str]] = None,
+        api_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        runtime_config = dict(api_config or {})
+        runtime_config.setdefault("api_key", self.api_key)
+        runtime_config.setdefault("model", self.model)
+        runtime_config.setdefault("base_url", self.base_url)
+        runtime_config.setdefault("llm_execution_mode", "direct_api")
+        model = runtime_config.get("model") or self.model
+        base_url = runtime_config.get("base_url") or self.base_url
+
+        sql = self.repair_sql(
+            question,
+            failed_sql,
+            error_message,
+            ddl_list=ddl_list,
+            api_config=runtime_config,
+        )
+        return {
+            "sql": sql,
+            "trace": {
+                "model": model,
+                "base_url": base_url,
+                "ddl_count": len(ddl_list or []),
+            },
+        }
 
     def _build_prompt(
         self,

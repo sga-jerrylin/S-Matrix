@@ -300,6 +300,8 @@ export const dorisApi = {
   // LLM 配置管理
   llm: {
     create: (data: LLMConfigRequest) => api.post('/api/llm/config', data),
+    update: (resourceName: string, data: LLMConfigRequest) =>
+      api.put(`/api/llm/config/${resourceName}`, data),
     list: () => api.get('/api/llm/config'),
     test: (resourceName: string) => api.post(`/api/llm/config/${resourceName}/test`),
     delete: (resourceName: string) => api.delete(`/api/llm/config/${resourceName}`),

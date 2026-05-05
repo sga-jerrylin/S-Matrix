@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import json
 import logging
-from math import ceil
+from math import ceil, sqrt
 import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -43,6 +43,12 @@ _TEMPORAL_LOOKBACK_DEFAULTS = {
 }
 _TEMPORAL_ANALYSIS_TYPES = {"trend", "seasonality", "anomaly", "comparison"}
 _TEMPORAL_COMPARISON_MODES = {"wow", "mom", "qoq", "yoy", "baseline", "none"}
+_INSIGHT_REPORT_CONTRACT_VERSION = "insight.report.read.v1"
+_INSIGHT_REPORT_SUMMARY_CONTRACT_VERSION = "insight.report.summary.v1"
+_SUMMARY_SECTION_LIMIT = 3
+_FORECAST_RESULT_CONTRACT_VERSION = "insight.forecast.result.v1"
+_FORECAST_MODEL_VERSION = "baseline.internal.v1"
+_FORECAST_DEFAULT_CONFIDENCE = 0.8
 
 
 class AnalystAgent:
@@ -50,9 +56,10 @@ class AnalystAgent:
     Data analysis expert agent built on top of the existing Doris stack.
     """
 
-    def __init__(self, doris_client, build_api_config_fn):
+    def __init__(self, doris_client, build_api_config_fn, metric_provider=None):
         self.db = doris_client
         self.build_api_config = build_api_config_fn
+        self.metric_provider = metric_provider
 
     def init_tables(self) -> bool:
         """Create system tables required by the analyst workflow."""
@@ -126,6 +133,7 @@ class AnalystAgent:
             schedule_id=schedule_id,
             note=note,
         )
+        report = self._normalize_report_contract(report)
         self._save_report(report)
         return report
 
@@ -243,6 +251,7 @@ class AnalystAgent:
             schedule_id=schedule_id,
             note=note,
         )
+        report = self._normalize_report_contract(report)
         self._save_report(report)
         return report
 
@@ -340,8 +349,730 @@ class AnalystAgent:
             schedule_id=schedule_id,
             note=note,
         )
+        report = self._normalize_report_contract(report)
         self._save_report(report)
         return report
+
+    def forecast_metric(
+        self,
+        metric_key: str,
+        *,
+        granularity: str = "day",
+        horizon_steps: int = 7,
+        start_at: Optional[str] = None,
+        end_at: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        lookback_points: int = 180,
+        metric_provider: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        normalized_granularity = (granularity or "day").strip().lower()
+        forecast_id = str(uuid.uuid4())
+        resolved_provider = metric_provider or self.metric_provider
+        payload = self._build_forecast_payload_shell(
+            forecast_id=forecast_id,
+            metric_key=metric_key,
+            granularity=normalized_granularity,
+            horizon_steps=horizon_steps,
+        )
+
+        try:
+            if horizon_steps <= 0:
+                return self._build_forecast_error(
+                    payload,
+                    code="invalid_horizon",
+                    message="horizon_steps must be greater than 0.",
+                )
+            if normalized_granularity not in {"day", "week", "month"}:
+                return self._build_forecast_error(
+                    payload,
+                    code="invalid_granularity",
+                    message="granularity must be one of day, week, month.",
+                )
+
+            window_start, window_end = self._resolve_forecast_window(
+                start_at=start_at,
+                end_at=end_at,
+                granularity=normalized_granularity,
+                lookback_points=lookback_points,
+            )
+            payload["horizon"]["history_window"] = {
+                "start_at": window_start.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_at": window_end.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            registered_metric = self._get_metric_definition_from_provider(resolved_provider, metric_key)
+            metric_source = "registered_metric"
+            metric_spec: Dict[str, Any]
+
+            if registered_metric:
+                metric_spec = self._build_metric_spec_from_metric_definition(registered_metric)
+                availability = registered_metric.get("availability") or self._evaluate_metric_availability_from_provider(
+                    resolved_provider,
+                    registered_metric,
+                )
+                if availability and not availability.get("forecast_ready"):
+                    return self._build_forecast_error(
+                        payload,
+                        code="metric_not_forecast_ready",
+                        message="metric is not forecast-ready according to metric foundation",
+                        details={
+                            "metric_source": metric_source,
+                            "blocking_reasons": availability.get("blocking_reasons") or [],
+                        },
+                    )
+                series_payload = self._get_metric_series_from_provider(
+                    resolved_provider,
+                    metric_key=metric_key,
+                    start_time=window_start,
+                    end_time=window_end,
+                    granularity=normalized_granularity,
+                    filters=filters,
+                    limit=max(int(lookback_points) * 2, int(horizon_steps) * 4, 200),
+                )
+                series = self._build_series_from_metric_surface_points(
+                    series_payload.get("points") or [],
+                    granularity=normalized_granularity,
+                    aggregation=metric_spec["aggregation"],
+                )
+            else:
+                metric_source = "legacy_expression_compat"
+                metric_spec = self._parse_metric_key(metric_key)
+                compat_metric = self._build_compat_metric_definition(
+                    metric_key=metric_key,
+                    metric_spec=metric_spec,
+                    granularity=normalized_granularity,
+                    filters=filters,
+                )
+                availability = self._evaluate_metric_availability_from_provider(resolved_provider, compat_metric)
+                if availability and not availability.get("forecast_ready"):
+                    return self._build_forecast_error(
+                        payload,
+                        code="metric_not_forecast_ready",
+                        message="metric is not forecast-ready according to metric foundation",
+                        details={
+                            "metric_source": metric_source,
+                            "blocking_reasons": availability.get("blocking_reasons") or [],
+                        },
+                    )
+                raw_rows = self._query_metric_rows(
+                    metric_spec,
+                    start_at=window_start,
+                    end_at=window_end,
+                    filters=filters,
+                )
+                series = self._build_metric_series(
+                    raw_rows,
+                    granularity=normalized_granularity,
+                    aggregation=metric_spec["aggregation"],
+                    value_column=metric_spec["value_column"],
+                )
+
+            payload["model_info"]["aggregation"] = metric_spec["aggregation"]
+            payload["model_info"]["table_name"] = metric_spec["table_name"]
+            payload["model_info"]["time_column"] = metric_spec["time_column"]
+            payload["model_info"]["value_column"] = metric_spec["value_column"]
+            payload["model_info"]["metric_source"] = metric_source
+
+            if len(series) < 3:
+                return self._build_forecast_error(
+                    payload,
+                    code="insufficient_history",
+                    message="At least 3 historical points are required for baseline forecast.",
+                    details={"history_points": len(series)},
+                )
+
+            if lookback_points > 0 and len(series) > lookback_points:
+                series = series[-lookback_points:]
+
+            history_values = [float(item["value"]) for item in series]
+            history_dates = [item["bucket"] for item in series]
+            holdout_points = min(max(1, horizon_steps), max(1, len(history_values) // 3))
+            if len(history_values) - holdout_points < 2:
+                holdout_points = 1
+            if len(history_values) - holdout_points < 2:
+                return self._build_forecast_error(
+                    payload,
+                    code="insufficient_training_points",
+                    message="Not enough training points after holdout split.",
+                    details={"history_points": len(history_values), "holdout_points": holdout_points},
+                )
+
+            train_values = history_values[:-holdout_points]
+            test_values = history_values[-holdout_points:]
+            backtest_predictions, backtest_model = self._baseline_forecast_values(
+                train_values,
+                holdout_points,
+                granularity=normalized_granularity,
+                aggregation=metric_spec["aggregation"],
+            )
+            backtest_summary = self._compute_backtest_summary(
+                actual_values=test_values,
+                predicted_values=backtest_predictions,
+                train_points=len(train_values),
+                holdout_points=holdout_points,
+            )
+
+            forecast_values, forecast_model = self._baseline_forecast_values(
+                history_values,
+                horizon_steps,
+                granularity=normalized_granularity,
+                aggregation=metric_spec["aggregation"],
+            )
+            residual_std = float(backtest_summary.get("residual_std") or 0.0)
+            if residual_std <= 0:
+                baseline_scale = abs(sum(history_values) / len(history_values)) if history_values else 1.0
+                residual_std = max(1e-6, baseline_scale * 0.05)
+
+            last_bucket = history_dates[-1]
+            forecast_points = []
+            for index, value in enumerate(forecast_values, start=1):
+                point_date = self._add_granularity(last_bucket, normalized_granularity, index)
+                interval_width = 1.28155 * residual_std * sqrt(index)
+                lower = value - interval_width
+                upper = value + interval_width
+                if metric_spec["aggregation"] in {"count", "count_distinct", "sum"}:
+                    lower = max(0.0, lower)
+                    upper = max(lower, upper)
+                forecast_points.append(
+                    {
+                        "ts": point_date.isoformat(),
+                        "value": round(float(value), 6),
+                        "lower": round(float(lower), 6),
+                        "upper": round(float(upper), 6),
+                        "confidence": _FORECAST_DEFAULT_CONFIDENCE,
+                    }
+                )
+
+            payload["success"] = True
+            payload["status"] = "completed"
+            payload["points"] = forecast_points
+            payload["assumptions"] = [
+                f"Baseline model uses {forecast_model} over internal metric history only.",
+                "External signals are not used in this MVP.",
+                f"Granularity is fixed at {normalized_granularity}.",
+                f"Metric source: {metric_source}.",
+            ]
+            payload["backtest_summary"] = backtest_summary
+            payload["model_info"].update(
+                {
+                    "name": forecast_model,
+                    "version": _FORECAST_MODEL_VERSION,
+                    "granularity": normalized_granularity,
+                    "training_points": len(history_values),
+                    "history_points": len(history_values),
+                    "status": "ready",
+                    "backtest_model": backtest_model,
+                }
+            )
+            payload["horizon"]["start_at"] = forecast_points[0]["ts"]
+            payload["horizon"]["end_at"] = forecast_points[-1]["ts"]
+            payload["history"] = {
+                "points": len(history_values),
+                "start_at": history_dates[0].isoformat(),
+                "end_at": history_dates[-1].isoformat(),
+                "last_value": round(float(history_values[-1]), 6),
+            }
+            return payload
+        except ValueError as exc:
+            return self._build_forecast_error(
+                payload,
+                code="invalid_input",
+                message=str(exc),
+            )
+        except Exception as exc:
+            logger.exception("forecast metric failed: %s", exc)
+            return self._build_forecast_error(
+                payload,
+                code="forecast_failed",
+                message=str(exc),
+            )
+
+    def _build_forecast_payload_shell(
+        self,
+        *,
+        forecast_id: str,
+        metric_key: str,
+        granularity: str,
+        horizon_steps: int,
+    ) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "status": "failed",
+            "contract_version": _FORECAST_RESULT_CONTRACT_VERSION,
+            "forecast_id": forecast_id,
+            "metric_key": metric_key,
+            "horizon": {
+                "steps": int(horizon_steps),
+                "unit": granularity,
+                "granularity": granularity,
+                "start_at": None,
+                "end_at": None,
+                "history_window": {
+                    "start_at": None,
+                    "end_at": None,
+                },
+            },
+            "points": [],
+            "assumptions": [],
+            "backtest_summary": {
+                "status": "unavailable",
+                "holdout_points": 0,
+                "train_points": 0,
+                "mae": None,
+                "rmse": None,
+                "mape": None,
+                "residual_std": None,
+            },
+            "model_info": {
+                "name": "baseline_internal",
+                "version": _FORECAST_MODEL_VERSION,
+                "status": "failed",
+                "granularity": granularity,
+                "aggregation": None,
+                "table_name": None,
+                "time_column": None,
+                "value_column": None,
+                "training_points": 0,
+                "history_points": 0,
+            },
+        }
+
+    def _build_forecast_error(
+        self,
+        payload: Dict[str, Any],
+        *,
+        code: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        error_payload = dict(payload)
+        error_payload["success"] = False
+        error_payload["status"] = "failed"
+        error_payload["points"] = []
+        error_payload["error"] = {
+            "code": code,
+            "message": message,
+            "details": details or {},
+        }
+        error_payload.setdefault("backtest_summary", {})
+        error_payload["backtest_summary"]["status"] = "unavailable"
+        error_payload.setdefault("model_info", {})
+        error_payload["model_info"]["status"] = "failed"
+        return error_payload
+
+    def _get_metric_definition_from_provider(self, provider: Any, metric_key: str) -> Optional[Dict[str, Any]]:
+        if provider is None:
+            return None
+        getter = getattr(provider, "get_metric_definition", None)
+        if not callable(getter):
+            return None
+        return getter(metric_key)
+
+    def _get_metric_series_from_provider(
+        self,
+        provider: Any,
+        *,
+        metric_key: str,
+        start_time: datetime,
+        end_time: datetime,
+        granularity: str,
+        filters: Optional[Dict[str, Any]],
+        limit: int,
+    ) -> Dict[str, Any]:
+        getter = getattr(provider, "get_metric_series", None) if provider is not None else None
+        if not callable(getter):
+            raise ValueError("metric provider does not support metric series reads")
+        return getter(
+            metric_key,
+            start_time=start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            end_time=end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            grain=granularity,
+            filters=filters or {},
+            limit=max(1, min(int(limit), 20000)),
+        )
+
+    def _evaluate_metric_availability_from_provider(
+        self,
+        provider: Any,
+        metric_definition: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if provider is None:
+            return None
+        evaluator = getattr(provider, "evaluate_metric_availability", None)
+        if not callable(evaluator):
+            return None
+        return evaluator(metric_definition)
+
+    def _build_metric_spec_from_metric_definition(self, metric_definition: Dict[str, Any]) -> Dict[str, str]:
+        aggregation = str(metric_definition.get("aggregation") or "").strip().lower()
+        if aggregation not in {"sum", "avg", "min", "max", "count", "count_distinct"}:
+            raise ValueError(f"Unsupported metric aggregation for forecast: '{aggregation}'")
+        table_name = str(metric_definition.get("table_name") or "").strip()
+        time_column = str(metric_definition.get("time_field") or "").strip()
+        value_column = str(metric_definition.get("value_field") or "").strip()
+        if not table_name or not time_column:
+            raise ValueError("Metric definition must include table_name and time_field")
+        if aggregation in {"sum", "avg", "min", "max", "count_distinct"} and not value_column:
+            raise ValueError(f"Metric definition requires value_field for aggregation '{aggregation}'")
+        if aggregation == "count":
+            value_column = value_column or "*"
+        return {
+            "table_name": table_name,
+            "aggregation": aggregation,
+            "time_column": time_column,
+            "value_column": value_column or "*",
+        }
+
+    def _build_compat_metric_definition(
+        self,
+        *,
+        metric_key: str,
+        metric_spec: Dict[str, str],
+        granularity: str,
+        filters: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        filter_dimensions = sorted([str(key) for key in (filters or {}).keys() if str(key).strip()])
+        value_field = metric_spec["value_column"] if metric_spec["value_column"] != "*" else ""
+        return {
+            "metric_key": metric_key,
+            "display_name": metric_key,
+            "description": "legacy metric_key compatibility",
+            "table_name": metric_spec["table_name"],
+            "time_field": metric_spec["time_column"],
+            "value_field": value_field,
+            "aggregation_expression": "",
+            "aggregation": metric_spec["aggregation"],
+            "default_grain": granularity,
+            "dimensions": filter_dimensions,
+        }
+
+    def _build_series_from_metric_surface_points(
+        self,
+        points: Sequence[Dict[str, Any]],
+        *,
+        granularity: str,
+        aggregation: str,
+    ) -> List[Dict[str, Any]]:
+        grouped: Dict[date, List[float]] = {}
+        for point in points:
+            dt_value = self._coerce_datetime_value(point.get("ts"))
+            if dt_value is None:
+                continue
+            numeric = self._coerce_float(point.get("value"))
+            if numeric is None:
+                continue
+            bucket = self._bucket_datetime(dt_value, granularity)
+            grouped.setdefault(bucket, []).append(float(numeric))
+
+        series: List[Dict[str, Any]] = []
+        for bucket in sorted(grouped.keys()):
+            values = grouped[bucket]
+            if not values:
+                continue
+            if aggregation == "sum":
+                metric_value = sum(values)
+            elif aggregation == "avg":
+                metric_value = sum(values) / len(values)
+            elif aggregation == "min":
+                metric_value = min(values)
+            elif aggregation == "max":
+                metric_value = max(values)
+            else:
+                metric_value = sum(values)
+            series.append(
+                {
+                    "bucket": bucket,
+                    "ts": bucket.isoformat(),
+                    "value": float(metric_value),
+                }
+            )
+        return series
+
+    def _parse_metric_key(self, metric_key: str) -> Dict[str, str]:
+        pattern = (
+            r"^\s*([\w\-\u4e00-\u9fa5]+)\."
+            r"(sum|avg|min|max|count)\("
+            r"(\*|[\w\-\u4e00-\u9fa5]+)\)"
+            r"@([\w\-\u4e00-\u9fa5]+)\s*$"
+        )
+        match = re.match(pattern, str(metric_key or ""), flags=re.IGNORECASE)
+        if not match:
+            raise ValueError(
+                "metric_key must be a registered metric id from metric foundation, "
+                "or match legacy '<table>.<agg>(<value_column>|*)@<time_column>' "
+                "(for example 'orders.sum(amount)@order_date')."
+            )
+        table_name, aggregation, value_column, time_column = match.groups()
+        aggregation = aggregation.lower()
+        if aggregation != "count" and value_column == "*":
+            raise ValueError("Only count aggregation can use '*'.")
+        return {
+            "table_name": table_name,
+            "aggregation": aggregation,
+            "value_column": value_column,
+            "time_column": time_column,
+        }
+
+    def _resolve_forecast_window(
+        self,
+        *,
+        start_at: Optional[str],
+        end_at: Optional[str],
+        granularity: str,
+        lookback_points: int,
+    ) -> Tuple[datetime, datetime]:
+        parsed_start = self._parse_optional_datetime(start_at)
+        parsed_end = self._parse_optional_datetime(end_at)
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        if parsed_end is None:
+            parsed_end = now_utc
+        if parsed_start is None:
+            points = max(lookback_points, 30)
+            if granularity == "week":
+                parsed_start = parsed_end - timedelta(days=7 * points)
+            elif granularity == "month":
+                parsed_start = parsed_end - timedelta(days=31 * points)
+            else:
+                parsed_start = parsed_end - timedelta(days=points)
+        if parsed_start > parsed_end:
+            raise ValueError("start_at must be earlier than or equal to end_at.")
+        return parsed_start, parsed_end
+
+    def _parse_optional_datetime(self, value: Optional[str]) -> Optional[datetime]:
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+
+    def _query_metric_rows(
+        self,
+        metric_spec: Dict[str, str],
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        filters: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        safe_table = self.db.validate_identifier(metric_spec["table_name"])
+        safe_time_column = self.db.validate_identifier(metric_spec["time_column"])
+        aggregation = metric_spec["aggregation"]
+        value_column = metric_spec["value_column"]
+        if aggregation == "count" and value_column == "*":
+            value_expr = "1"
+        else:
+            value_expr = self.db.validate_identifier(value_column)
+
+        where_clauses = [f"{safe_time_column} IS NOT NULL", f"{safe_time_column} >= %s", f"{safe_time_column} <= %s"]
+        params: List[Any] = [
+            start_at.strftime("%Y-%m-%d %H:%M:%S"),
+            end_at.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        for key, value in sorted((filters or {}).items()):
+            safe_key = self.db.validate_identifier(str(key))
+            if isinstance(value, list):
+                if not value:
+                    continue
+                placeholders = ", ".join(["%s"] * len(value))
+                where_clauses.append(f"{safe_key} IN ({placeholders})")
+                params.extend(value)
+                continue
+            if value is None:
+                where_clauses.append(f"{safe_key} IS NULL")
+                continue
+            where_clauses.append(f"{safe_key} = %s")
+            params.append(value)
+
+        sql = (
+            f"SELECT {safe_time_column} AS ts, {value_expr} AS metric_value "
+            f"FROM {safe_table} "
+            f"WHERE {' AND '.join(where_clauses)} "
+            f"ORDER BY {safe_time_column} ASC"
+        )
+        return self.db.execute_query(sql, tuple(params))
+
+    def _build_metric_series(
+        self,
+        rows: Sequence[Dict[str, Any]],
+        *,
+        granularity: str,
+        aggregation: str,
+        value_column: str,
+    ) -> List[Dict[str, Any]]:
+        grouped: Dict[date, List[float]] = {}
+        for row in rows:
+            dt_value = self._coerce_datetime_value(row.get("ts"))
+            if dt_value is None:
+                continue
+            bucket = self._bucket_datetime(dt_value, granularity)
+            value = row.get("metric_value")
+            if aggregation == "count":
+                if value_column == "*":
+                    numeric = 1.0
+                else:
+                    numeric = 1.0 if value is not None else 0.0
+            else:
+                numeric = self._coerce_float(value)
+                if numeric is None:
+                    continue
+            grouped.setdefault(bucket, []).append(float(numeric))
+
+        series: List[Dict[str, Any]] = []
+        for bucket in sorted(grouped.keys()):
+            values = grouped[bucket]
+            if not values:
+                continue
+            if aggregation == "sum":
+                metric_value = sum(values)
+            elif aggregation == "avg":
+                metric_value = sum(values) / len(values)
+            elif aggregation == "min":
+                metric_value = min(values)
+            elif aggregation == "max":
+                metric_value = max(values)
+            else:
+                metric_value = float(len(values))
+            series.append(
+                {
+                    "bucket": bucket,
+                    "ts": bucket.isoformat(),
+                    "value": float(metric_value),
+                }
+            )
+        return series
+
+    def _coerce_datetime_value(self, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo:
+                return value.astimezone(timezone.utc).replace(tzinfo=None)
+            return value
+        if isinstance(value, date):
+            return datetime(value.year, value.month, value.day)
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            normalized = text.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
+        except ValueError:
+            return None
+
+    def _coerce_float(self, value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _bucket_datetime(self, value: datetime, granularity: str) -> date:
+        current_date = value.date()
+        if granularity == "week":
+            return current_date - timedelta(days=current_date.weekday())
+        if granularity == "month":
+            return current_date.replace(day=1)
+        return current_date
+
+    def _add_granularity(self, value: date, granularity: str, steps: int) -> date:
+        if granularity == "week":
+            return value + timedelta(days=7 * steps)
+        if granularity == "month":
+            year = value.year
+            month = value.month
+            total_month = (month - 1) + steps
+            year += total_month // 12
+            month = (total_month % 12) + 1
+            return date(year, month, 1)
+        return value + timedelta(days=steps)
+
+    def _baseline_forecast_values(
+        self,
+        history_values: Sequence[float],
+        steps: int,
+        *,
+        granularity: str,
+        aggregation: str,
+    ) -> Tuple[List[float], str]:
+        if steps <= 0:
+            return [], "baseline_internal"
+        seasonal_map = {"day": 7, "week": 4, "month": 3}
+        seasonal_period = seasonal_map.get(granularity, 7)
+        history = [float(value) for value in history_values]
+        predictions: List[float] = []
+
+        if len(history) >= seasonal_period * 2:
+            extended = list(history)
+            for _ in range(steps):
+                source_index = len(extended) - seasonal_period
+                predicted = float(extended[source_index]) if source_index >= 0 else float(extended[-1])
+                predictions.append(predicted)
+                extended.append(predicted)
+            model_name = f"seasonal_naive_p{seasonal_period}"
+        else:
+            window = min(max(2, seasonal_period), len(history))
+            window_values = history[-window:]
+            baseline = sum(window_values) / len(window_values)
+            slope = 0.0
+            if len(window_values) > 1:
+                slope = (window_values[-1] - window_values[0]) / float(len(window_values) - 1)
+            for step in range(1, steps + 1):
+                predictions.append(float(baseline + slope * step))
+            model_name = f"moving_average_trend_w{window}"
+
+        if aggregation in {"count", "count_distinct", "sum"}:
+            predictions = [max(0.0, float(item)) for item in predictions]
+        return predictions, model_name
+
+    def _compute_backtest_summary(
+        self,
+        *,
+        actual_values: Sequence[float],
+        predicted_values: Sequence[float],
+        train_points: int,
+        holdout_points: int,
+    ) -> Dict[str, Any]:
+        pairs = list(zip(actual_values, predicted_values))
+        if not pairs:
+            return {
+                "status": "unavailable",
+                "holdout_points": 0,
+                "train_points": train_points,
+                "mae": None,
+                "rmse": None,
+                "mape": None,
+                "residual_std": None,
+            }
+        errors = [actual - predicted for actual, predicted in pairs]
+        absolute_errors = [abs(error) for error in errors]
+        mae = sum(absolute_errors) / len(absolute_errors)
+        rmse = sqrt(sum((error * error) for error in errors) / len(errors))
+        valid_pct_errors = [
+            abs((actual - predicted) / actual)
+            for actual, predicted in pairs
+            if actual not in (0, 0.0)
+        ]
+        mape = (sum(valid_pct_errors) / len(valid_pct_errors) * 100.0) if valid_pct_errors else None
+        residual_mean = sum(errors) / len(errors)
+        residual_var = sum((error - residual_mean) ** 2 for error in errors) / len(errors)
+        residual_std = sqrt(residual_var)
+        return {
+            "status": "ok",
+            "holdout_points": holdout_points,
+            "train_points": train_points,
+            "mae": round(float(mae), 6),
+            "rmse": round(float(rmse), 6),
+            "mape": round(float(mape), 6) if mape is not None else None,
+            "residual_std": round(float(residual_std), 6),
+        }
 
     def list_reports(
         self,
@@ -352,7 +1083,7 @@ class AnalystAgent:
         sql = """
         SELECT `id`, `table_names`, `trigger_type`, `depth`, `schedule_id`, `history_id`,
                `summary`, `insight_count`, `anomaly_count`, `failed_step_count`, `status`,
-               `error_message`, `duration_ms`, `created_at`
+               `error_message`, `duration_ms`, `created_at`, `report_json`
         FROM `_sys_analysis_reports`
         """
         params: List[Any] = []
@@ -362,10 +1093,18 @@ class AnalystAgent:
         sql += " ORDER BY `created_at` DESC LIMIT %s OFFSET %s"
         params.extend([limit, offset])
         rows = self.db.execute_query(sql, tuple(params))
+        reports = [
+            self._build_report_summary_payload(
+                self._normalize_report_contract(dict(row or {}), summary_only=True),
+                include_identity=True,
+            )
+            for row in rows
+        ]
         return {
             "success": True,
-            "reports": rows,
-            "count": len(rows),
+            "contract_version": _INSIGHT_REPORT_SUMMARY_CONTRACT_VERSION,
+            "reports": reports,
+            "count": len(reports),
             "limit": limit,
             "offset": offset,
         }
@@ -380,6 +1119,15 @@ class AnalystAgent:
         payload = rows[0].get("report_json") or "{}"
         report = json.loads(payload) if isinstance(payload, str) else payload
         return self._filter_report_reasoning(report, include_reasoning=include_reasoning)
+
+    def get_report_summary(self, report_id: str) -> Dict[str, Any]:
+        report = self.get_report(report_id, include_reasoning=False)
+        if not report.get("success"):
+            return report
+        normalized = self._normalize_report_contract(report, summary_only=True)
+        summary = self._build_report_summary_payload(normalized, include_identity=True)
+        summary["success"] = bool(report.get("success", True))
+        return summary
 
     def delete_report(self, report_id: str) -> Dict[str, Any]:
         self.db.execute_update("DELETE FROM `_sys_analysis_reports` WHERE `id` = %s", (report_id,))
@@ -408,10 +1156,266 @@ class AnalystAgent:
         *,
         include_reasoning: bool = False,
     ) -> Dict[str, Any]:
-        payload = self._hydrate_expert_sections(dict(report or {}))
+        payload = self._normalize_report_contract(dict(report or {}))
         if not include_reasoning:
             payload.pop("reasoning_traces", None)
         return payload
+
+    def _normalize_report_contract(
+        self,
+        report: Optional[Dict[str, Any]],
+        *,
+        summary_only: bool = False,
+    ) -> Dict[str, Any]:
+        payload = self._merge_embedded_report_payload(dict(report or {}))
+        payload = self._hydrate_expert_sections(payload)
+
+        insights = self._normalize_report_items(payload.get("insights"), default_prefix="Insight")
+        top_insights = self._normalize_report_items(
+            payload.get("top_insights"),
+            default_prefix="Top insight",
+        ) or insights[:_EXPERT_MAIN_SECTION_LIMIT]
+        anomalies = self._normalize_report_items(payload.get("anomalies"), default_prefix="Anomaly")
+        recommendations = self._normalize_report_text_list(payload.get("recommendations"))
+        action_items = self._normalize_report_action_items(payload.get("action_items"), recommendations)
+        if not recommendations and action_items:
+            recommendations = [self._action_item_as_text(item) for item in action_items]
+
+        if summary_only:
+            insights = insights[:_SUMMARY_SECTION_LIMIT]
+            top_insights = top_insights[:_SUMMARY_SECTION_LIMIT]
+            anomalies = anomalies[:_SUMMARY_SECTION_LIMIT]
+            recommendations = recommendations[:_SUMMARY_SECTION_LIMIT]
+            action_items = action_items[:_SUMMARY_SECTION_LIMIT]
+
+        summary = self._normalize_report_summary(
+            payload.get("summary"),
+            top_insights,
+            recommendations,
+        )
+        insight_count = self._coerce_non_negative_int(payload.get("insight_count"), len(insights))
+        anomaly_count = self._coerce_non_negative_int(payload.get("anomaly_count"), len(anomalies))
+
+        payload["summary"] = summary
+        payload["insights"] = insights
+        payload["top_insights"] = top_insights
+        payload["anomalies"] = anomalies
+        payload["recommendations"] = recommendations
+        payload["action_items"] = action_items
+        payload["insight_count"] = insight_count
+        payload["anomaly_count"] = anomaly_count
+        payload["tables"] = self._decode_table_names(payload.get("table_names"))
+        if not payload.get("table_names") and payload.get("tables"):
+            payload["table_names"] = ",".join(payload["tables"])
+        payload["contract_version"] = _INSIGHT_REPORT_CONTRACT_VERSION
+        payload["summary_contract_version"] = _INSIGHT_REPORT_SUMMARY_CONTRACT_VERSION
+        payload["report_summary"] = self._build_report_summary_payload(payload, include_identity=False)
+
+        if (payload.get("depth") or "").strip().lower() == "expert":
+            payload["executive_summary"] = payload.get("executive_summary") or summary
+
+        return payload
+
+    def _build_report_summary_payload(
+        self,
+        payload: Dict[str, Any],
+        *,
+        include_identity: bool,
+    ) -> Dict[str, Any]:
+        summary_payload = {
+            "contract_version": _INSIGHT_REPORT_SUMMARY_CONTRACT_VERSION,
+            "summary": payload.get("summary") or "",
+            "insights": list(payload.get("insights") or [])[:_SUMMARY_SECTION_LIMIT],
+            "top_insights": list(payload.get("top_insights") or [])[:_SUMMARY_SECTION_LIMIT],
+            "anomalies": list(payload.get("anomalies") or [])[:_SUMMARY_SECTION_LIMIT],
+            "recommendations": list(payload.get("recommendations") or [])[:_SUMMARY_SECTION_LIMIT],
+            "action_items": list(payload.get("action_items") or [])[:_SUMMARY_SECTION_LIMIT],
+            "insight_count": self._coerce_non_negative_int(payload.get("insight_count")),
+            "anomaly_count": self._coerce_non_negative_int(payload.get("anomaly_count")),
+        }
+        if include_identity:
+            for key in (
+                "id",
+                "table_names",
+                "tables",
+                "trigger_type",
+                "depth",
+                "schedule_id",
+                "history_id",
+                "status",
+                "failed_step_count",
+                "error_message",
+                "duration_ms",
+                "created_at",
+                "note",
+            ):
+                summary_payload[key] = payload.get(key)
+        return summary_payload
+
+    def _merge_embedded_report_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        report_json = payload.get("report_json")
+        embedded: Dict[str, Any] = {}
+        if isinstance(report_json, dict):
+            embedded = dict(report_json)
+        elif isinstance(report_json, str):
+            parsed = self._parse_json_from_text(report_json)
+            if isinstance(parsed, dict):
+                embedded = parsed
+
+        if not embedded:
+            return payload
+
+        merged = dict(embedded)
+        merged.update(payload)
+        merged.pop("report_json", None)
+        return merged
+
+    def _normalize_report_items(
+        self,
+        items: Any,
+        *,
+        default_prefix: str,
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for index, item in enumerate(self._as_list(items), start=1):
+            payload = item if isinstance(item, dict) else {"detail": item}
+            title = (
+                payload.get("title")
+                or payload.get("name")
+                or payload.get("headline")
+                or payload.get("category")
+                or f"{default_prefix} {index}"
+            )
+            detail = (
+                payload.get("detail")
+                or payload.get("description")
+                or payload.get("message")
+                or payload.get("summary")
+                or title
+            )
+            normalized_item = dict(payload)
+            normalized_item["title"] = str(title).strip() or f"{default_prefix} {index}"
+            normalized_item["detail"] = str(detail).strip() or normalized_item["title"]
+            normalized.append(normalized_item)
+        return normalized
+
+    def _normalize_report_text_list(self, items: Any) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for item in self._as_list(items):
+            text = ""
+            if isinstance(item, dict):
+                title = (
+                    item.get("title")
+                    or item.get("name")
+                    or item.get("headline")
+                    or item.get("category")
+                )
+                detail = (
+                    item.get("detail")
+                    or item.get("description")
+                    or item.get("message")
+                    or item.get("summary")
+                )
+                if title and detail and str(title).strip() != str(detail).strip():
+                    text = f"{str(title).strip()}: {str(detail).strip()}"
+                else:
+                    text = str(detail or title or "").strip()
+            else:
+                text = str(item or "").strip()
+
+            if text and text not in seen:
+                seen.add(text)
+                normalized.append(text)
+        return normalized
+
+    def _normalize_report_action_items(
+        self,
+        items: Any,
+        recommendations: Sequence[str],
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+
+        for index, item in enumerate(self._as_list(items), start=1):
+            payload = item if isinstance(item, dict) else {"detail": item}
+            title = (
+                payload.get("title")
+                or payload.get("name")
+                or payload.get("headline")
+                or payload.get("category")
+                or f"Action item {index}"
+            )
+            detail = (
+                payload.get("detail")
+                or payload.get("description")
+                or payload.get("message")
+                or payload.get("summary")
+                or payload.get("action")
+                or title
+            )
+            normalized_item = dict(payload)
+            normalized_item["title"] = str(title).strip() or f"Action item {index}"
+            normalized_item["detail"] = str(detail).strip() or normalized_item["title"]
+            normalized.append(normalized_item)
+
+        if not normalized:
+            for index, recommendation in enumerate(recommendations, start=1):
+                text = str(recommendation or "").strip()
+                if not text:
+                    continue
+                normalized.append(
+                    {
+                        "title": f"Action item {index}",
+                        "detail": text,
+                    }
+                )
+
+        return normalized
+
+    def _normalize_report_summary(
+        self,
+        summary: Any,
+        top_insights: Sequence[Dict[str, Any]],
+        recommendations: Sequence[str],
+    ) -> str:
+        text = str(summary or "").strip()
+        if text:
+            return text
+
+        if top_insights:
+            primary = top_insights[0]
+            title = str(primary.get("title") or "").strip()
+            detail = str(primary.get("detail") or "").strip()
+            if title and detail and title != detail:
+                return f"{title}: {detail}"
+            if title or detail:
+                return title or detail
+
+        if recommendations:
+            recommendation = str(recommendations[0] or "").strip()
+            if recommendation:
+                return f"Analysis completed. Priority action: {recommendation}"
+
+        return "Analysis completed."
+
+    def _coerce_non_negative_int(self, value: Any, fallback: int = 0) -> int:
+        for candidate in (value, fallback):
+            try:
+                number = int(candidate)
+                if number >= 0:
+                    return number
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def _as_list(self, value: Any) -> List[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if value is None:
+            return []
+        return [value]
 
     def _hydrate_expert_sections(self, report: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(report or {})

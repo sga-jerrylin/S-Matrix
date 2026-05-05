@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 import requests
 
 from conftest import reload_main
+from llm_executor import LLMExecutionError
 from metadata_analyzer import MetadataAnalyzer
 from vanna_doris import VannaDoris
 
@@ -41,6 +42,18 @@ class FakeAgentDb:
             {"Field": "机构类型", "Type": "VARCHAR"},
             {"Field": "年份", "Type": "INT"},
         ]
+
+
+class FakeResourceDb(FakeAgentDb):
+    def __init__(self, resource_rows=None):
+        super().__init__()
+        self.resource_rows = resource_rows or []
+
+    def execute_query(self, sql, params=None):
+        normalized_sql = " ".join(str(sql).split())
+        if "SHOW RESOURCES" in normalized_sql:
+            return list(self.resource_rows)
+        return super().execute_query(sql, params)
 
 
 class SamplePhase2Vanna(VannaDoris):
@@ -164,3 +177,177 @@ def test_call_llm_uses_http_request_and_parses_markdown_json(monkeypatch):
     assert called["url"] == "https://example.test/chat/completions"
     assert called["headers"]["Authorization"] == "Bearer test-key"
     assert called["json"]["model"] == "deepseek-chat"
+
+
+def test_metadata_runtime_prefers_configured_resource_over_env_key(monkeypatch):
+    analyzer = MetadataAnalyzer()
+    analyzer.db = FakeResourceDb(
+        resource_rows=[
+            {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.provider_type", "Value": "openai"},
+            {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.endpoint", "Value": "https://api.openrouter.ai/v1/chat/completions"},
+            {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.model_name", "Value": "deepseek/deepseek-chat-v3-0324:free"},
+            {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.api_key", "Value": "******"},
+        ]
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-direct-key")
+
+    runtime = analyzer._build_runtime_api_config("openrutor")
+
+    assert runtime["success"] is True
+    config = runtime["api_config"]
+    assert config["resource_name"] == "openrutor"
+    assert config["llm_execution_mode"] == "doris_resource"
+    assert config["resource_timeout_seconds"] >= 1
+    assert config["resource_query_timeout_seconds"] >= 1
+
+
+def test_metadata_runtime_falls_back_to_direct_api_when_resource_key_unavailable(monkeypatch):
+    analyzer = MetadataAnalyzer()
+    analyzer.db = FakeResourceDb(
+        resource_rows=[
+            {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.provider_type", "Value": "openai"},
+            {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.endpoint", "Value": "https://api.openrouter.ai/v1/chat/completions"},
+            {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.model_name", "Value": "deepseek/deepseek-chat-v3-0324:free"},
+            {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.api_key", "Value": ""},
+        ]
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "env-direct-key")
+
+    runtime = analyzer._build_runtime_api_config("openrutor")
+
+    assert runtime["success"] is True
+    config = runtime["api_config"]
+    assert config["resource_name"] == "openrutor"
+    assert config["llm_execution_mode"] == "direct_api"
+    assert config["api_key"] == "env-direct-key"
+
+
+def test_compact_analysis_prompt_limits_schema_and_sample_payload():
+    analyzer = MetadataAnalyzer()
+    columns = [f"col_{idx}" for idx in range(80)]
+    sample_data = [{name: ("value-" + "x" * 240) for name in columns}]
+
+    prompt = analyzer._build_compact_analysis_prompt("orders", columns, sample_data)
+
+    assert "columns_total: 80" in prompt
+    assert "... (+32 more columns)" in prompt
+    assert "...(truncated)" in prompt
+    assert len(prompt) <= 12080
+
+
+def test_refresh_agent_assets_uses_fallback_without_second_resource_call():
+    class MiniDb:
+        def __init__(self):
+            self.updates = []
+
+        def validate_identifier(self, identifier):
+            return f"`{identifier}`"
+
+        def execute_query(self, sql, params=None):
+            if "SELECT * FROM `orders` LIMIT 10" in sql:
+                return [{"member_id": 1, "paid_amount": 12800, "created_at": "2026-05-01 00:00:00"}]
+            return []
+
+        def execute_update(self, sql, params=None):
+            self.updates.append((sql, params))
+            return 1
+
+    analyzer = MetadataAnalyzer()
+    analyzer.db = MiniDb()
+    analyzer.get_metadata = lambda table_name: {
+        "table_name": table_name,
+        "description": "订单事实表",
+        "columns_info": {
+            "member_id": "会员ID",
+            "paid_amount": "实收金额",
+            "created_at": "创建时间",
+        },
+    }
+    analyzer._call_llm_with_runtime = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("should not invoke second LLM resource call")
+    )
+
+    result = analyzer.refresh_agent_assets(
+        "orders",
+        "database_sync",
+        runtime_api_config={"llm_execution_mode": "doris_resource", "resource_name": "openrutor"},
+    )
+
+    assert result["success"] is True
+    fields = result["agent_config"]["fields"]
+    assert fields["paid_amount"]["semantic"] == "financial-income"
+    assert fields["created_at"]["semantic"] == "temporal-year"
+    assert fields["member_id"]["semantic"] == "id"
+
+
+def test_analyze_table_falls_back_to_local_semantics_on_resource_timeout():
+    class FallbackDb:
+        def __init__(self):
+            self.updates = []
+
+        def validate_identifier(self, identifier):
+            return f"`{identifier}`"
+
+        def get_table_schema(self, table_name):
+            return [
+                {"Field": "member_id", "Type": "BIGINT"},
+                {"Field": "paid_amount", "Type": "DECIMAL(18,2)"},
+                {"Field": "created_at", "Type": "DATETIME"},
+            ]
+
+        def execute_query(self, sql, params=None):
+            normalized = " ".join(str(sql).split())
+            if "SHOW RESOURCES" in normalized:
+                return [
+                    {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.provider_type", "Value": "openai"},
+                    {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.endpoint", "Value": "https://api.openrouter.ai/v1/chat/completions"},
+                    {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.model_name", "Value": "deepseek/deepseek-chat-v3-0324:free"},
+                    {"Name": "openrutor", "ResourceType": "ai", "Item": "ai.api_key", "Value": "******"},
+                ]
+            if "SELECT * FROM `orders` LIMIT 10" in normalized:
+                return [{"member_id": 101, "paid_amount": 256.8, "created_at": "2026-05-01 10:00:00"}]
+            return []
+
+        def execute_update(self, sql, params=None):
+            self.updates.append((sql, params))
+            return 1
+
+    analyzer = MetadataAnalyzer()
+    analyzer.db = FallbackDb()
+
+    def fake_llm(*args, **kwargs):
+        raise LLMExecutionError(
+            "resource timeout",
+            llm_execution_mode="doris_resource",
+            resource_name="openrutor",
+            error_code="resource_timeout",
+        )
+
+    analyzer._call_llm_with_runtime = fake_llm
+
+    result = analyzer.analyze_table("orders", "manual", resource_name="openrutor")
+
+    assert result["success"] is True
+    assert result["fallback_used"] is True
+    assert result["fallback_reason"] == "resource_timeout"
+    assert result["llm_execution_mode"] == "doris_resource"
+    assert result["resource_name"] == "openrutor"
+    assert result["analysis"]["columns"]["paid_amount"].startswith("金额字段")
+
+
+def test_analysis_column_coverage_fills_missing_schema_columns():
+    analyzer = MetadataAnalyzer()
+    merged = analyzer._ensure_analysis_column_coverage(
+        "orders",
+        {
+            "display_name": "订单表",
+            "description": "订单信息",
+            "columns": {"order_id": "订单ID，整数"},
+        },
+        ["order_id", "paid_amount", "created_at"],
+        [{"order_id": 1, "paid_amount": 99.5, "created_at": "2026-05-01 00:00:00"}],
+    )
+
+    assert merged["columns"]["order_id"] == "订单ID，整数"
+    assert merged["columns"]["paid_amount"].startswith("金额字段")
+    assert merged["columns"]["created_at"].startswith("时间字段")

@@ -24,45 +24,36 @@
             mode="inline"
             style="height: 100%; border-right: 0"
           >
-            <a-menu-item key="datasource">
-              <cloud-sync-outlined />
-              <span>数据源同步</span>
-            </a-menu-item>
-            <a-menu-item key="registry">
-              <table-outlined />
-              <span>已同步表格</span>
-            </a-menu-item>
             <a-menu-item key="upload">
               <upload-outlined />
-              <span>Excel 上传</span>
-            </a-menu-item>
-            <a-menu-item key="llm">
-              <api-outlined />
-              <span>LLM 配置</span>
-            </a-menu-item>
-            <a-menu-item key="natural">
-              <robot-outlined />
-              <span>AI 问答</span>
+              <span>准备数据 (上传)</span>
             </a-menu-item>
             <a-menu-item key="query">
               <search-outlined />
-              <span>数据查询</span>
+              <span>数据查询 (查询)</span>
             </a-menu-item>
             <a-menu-item key="analysis">
               <fund-outlined />
-              <span>数据分析</span>
+              <span>智能洞察 (洞察)</span>
+            </a-menu-item>
+            <a-menu-item key="forecast">
+              <line-chart-outlined />
+              <span>业务预测 (预测)</span>
+            </a-menu-item>
+            <a-divider style="margin: 8px 0" />
+            <a-menu-item key="llm">
+              <api-outlined />
+              <span>系统设置 (LLM)</span>
             </a-menu-item>
           </a-menu>
         </a-layout-sider>
 
         <a-layout-content style="background: #f0f2f5; padding: 24px; min-height: 280px">
-          <DataSourceSync v-if="selectedKeys[0] === 'datasource'" />
-          <TableRegistry v-if="selectedKeys[0] === 'registry'" />
-          <ExcelUpload v-if="selectedKeys[0] === 'upload'" />
-          <LLMConfig v-if="selectedKeys[0] === 'llm'" />
-          <NaturalQuery v-if="selectedKeys[0] === 'natural'" />
-          <DataQuery v-if="selectedKeys[0] === 'query'" />
+          <WorkbenchUpload v-if="selectedKeys[0] === 'upload'" />
+          <WorkbenchQuery v-if="selectedKeys[0] === 'query'" />
           <DataAnalysis v-if="selectedKeys[0] === 'analysis'" />
+          <WorkbenchForecast v-if="selectedKeys[0] === 'forecast'" />
+          <LLMConfig v-if="selectedKeys[0] === 'llm'" />
         </a-layout-content>
       </a-layout>
     </a-layout>
@@ -94,18 +85,16 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue';
 import { message } from 'ant-design-vue';
-import { UploadOutlined, ApiOutlined, SearchOutlined, RobotOutlined, CloudSyncOutlined, TableOutlined, KeyOutlined, FundOutlined } from '@ant-design/icons-vue';
-import ExcelUpload from './components/ExcelUpload.vue';
+import { UploadOutlined, ApiOutlined, SearchOutlined, RobotOutlined, CloudSyncOutlined, TableOutlined, KeyOutlined, FundOutlined, LineChartOutlined } from '@ant-design/icons-vue';
 import LLMConfig from './components/LLMConfig.vue';
-import NaturalQuery from './components/NaturalQuery.vue';
-import DataQuery from './components/DataQuery.vue';
-import DataSourceSync from './components/DataSourceSync.vue';
-import TableRegistry from './components/TableRegistry.vue';
 import DataAnalysis from './components/DataAnalysis.vue';
+import WorkbenchUpload from './components/WorkbenchUpload.vue';
+import WorkbenchQuery from './components/WorkbenchQuery.vue';
+import WorkbenchForecast from './components/WorkbenchForecast.vue';
 import { dorisApi } from './api/doris';
 import { clearStoredGatewayApiKey, resolveGatewayApiKey, setStoredGatewayApiKey } from './api/auth';
 
-const selectedKeys = ref(['datasource']);
+const selectedKeys = ref(['upload']);
 const healthStatus = ref<'success' | 'error' | 'default'>('default');
 const healthText = ref('检查中...');
 const gatewayKeyModalOpen = ref(false);

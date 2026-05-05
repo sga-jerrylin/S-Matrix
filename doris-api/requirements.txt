@@ -13,7 +13,7 @@ DBUtils==3.1.0
 mcp==1.12.4
 
 # Vanna.AI for Text-to-SQL
-vanna==0.7.9
+vanna==2.0.2
 openai==1.54.5
 
 # Scheduler for periodic sync

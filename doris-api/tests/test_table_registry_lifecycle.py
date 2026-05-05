@@ -49,6 +49,7 @@ def test_delete_registered_table_drops_physical_table_and_cleans_assets():
     assert any("DELETE FROM `_sys_table_agents`" in sql for sql in executed_sql)
     assert any("DELETE FROM `_sys_field_catalog`" in sql for sql in executed_sql)
     assert any("DELETE FROM `_sys_table_relationships`" in sql for sql in executed_sql)
+    assert any("DELETE FROM `_sys_table_sources`" in sql for sql in executed_sql)
     assert any("DELETE FROM `_sys_table_registry`" in sql for sql in executed_sql)
     assert any("DELETE FROM `_sys_query_history`" in sql for sql in executed_sql)
 

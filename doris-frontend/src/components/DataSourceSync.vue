@@ -3,22 +3,63 @@
     <a-row :gutter="24">
       <!-- 左侧：数据源配置 -->
       <a-col :span="10">
-        <a-card title="数据源配置" :bordered="false">
-          <a-form :model="formState" layout="vertical">
+        <a-card title="新增数据源" :bordered="false">
+          <a-alert
+            type="info"
+            show-icon
+            style="margin-bottom: 16px"
+            message="这是新增数据源表单，不是当前数据源编辑区。"
+            description="选择已保存数据源仅用于右侧“源库可同步表”查看与同步，不会回填到左侧表单。"
+          />
+          <a-form :model="formState" layout="vertical" autocomplete="off">
+            <div class="autofill-trap" aria-hidden="true">
+              <input tabindex="-1" type="text" name="username" autocomplete="username" />
+              <input tabindex="-1" type="password" name="password" autocomplete="current-password" />
+            </div>
             <a-form-item label="数据源名称">
-              <a-input v-model:value="formState.name" placeholder="如：生产数据库" />
+              <a-input
+                v-model:value="formState.name"
+                placeholder="如：生产数据库"
+                autocomplete="off"
+                name="new-datasource-name"
+              />
             </a-form-item>
             <a-form-item label="主机地址 (Host)">
-              <a-input v-model:value="formState.host" placeholder="如：192.168.1.100" />
+              <a-input
+                v-model:value="formState.host"
+                placeholder="如：192.168.1.100"
+                autocomplete="off"
+                name="new-datasource-host"
+              />
             </a-form-item>
             <a-form-item label="端口 (Port)">
-              <a-input-number v-model:value="formState.port" :min="1" :max="65535" style="width: 100%" />
+              <a-input-number
+                v-model:value="formState.port"
+                :min="1"
+                :max="65535"
+                style="width: 100%"
+                name="new-datasource-port"
+              />
             </a-form-item>
             <a-form-item label="用户名 (User)">
-              <a-input v-model:value="formState.user" placeholder="数据库用户名" />
+              <a-input
+                v-model:value="formState.user"
+                placeholder="数据库用户名"
+                autocomplete="off"
+                name="new-datasource-db-user"
+                data-1p-ignore="true"
+                data-lpignore="true"
+              />
             </a-form-item>
             <a-form-item label="密码 (Password)">
-              <a-input-password v-model:value="formState.password" placeholder="数据库密码" />
+              <a-input-password
+                v-model:value="formState.password"
+                placeholder="数据库密码"
+                autocomplete="off"
+                name="new-datasource-db-secret"
+                data-1p-ignore="true"
+                data-lpignore="true"
+              />
             </a-form-item>
             <a-form-item label="数据库名">
               <a-select 
@@ -26,6 +67,7 @@
                 :options="databaseOptions"
                 placeholder="先测试连接获取数据库列表"
                 :disabled="databases.length === 0"
+                :show-search="true"
               />
             </a-form-item>
             <a-form-item>
@@ -67,7 +109,7 @@
 
       <!-- 右侧：表格同步 -->
       <a-col :span="14">
-        <a-card title="表格管理" :bordered="false">
+        <a-card title="源库可同步表" :bordered="false">
           <template #extra>
             <a-tag v-if="selectedDatasource" color="blue">
               当前: {{ selectedDatasource.name }}
@@ -79,8 +121,34 @@
           </div>
 
           <div v-else>
+            <a-alert
+              v-if="localSyncedTableCount > 0"
+              type="info"
+              :message="`本地已同步 ${localSyncedTableCount} 张表，可在“已同步表格”页签查看。`"
+              show-icon
+              style="margin-bottom: 16px"
+            />
+
+            <a-alert
+              v-if="remoteTablesError"
+              type="error"
+              show-icon
+              style="margin-bottom: 16px"
+            >
+              <template #message>源库表加载失败：{{ remoteTablesError }}</template>
+              <template #description>
+                <div style="margin-bottom: 10px">
+                  源库当前不可用，但本地已同步表仍可用于查询、洞察和预测。
+                </div>
+                <a-button type="primary" size="small" @click="goToRegistry">
+                  {{ registryEntryButtonText }}
+                </a-button>
+              </template>
+            </a-alert>
+
             <!-- 表格列表 -->
             <a-table
+              v-if="!remoteTablesError"
               :dataSource="remoteTables"
               :columns="tableColumns"
               :loading="tablesLoading"
@@ -121,19 +189,21 @@
               </template>
             </a-table>
 
-            <a-divider />
+            <template v-if="!remoteTablesError">
+              <a-divider />
 
-            <!-- 同步按钮 -->
-            <a-button
-              type="primary"
-              size="large"
-              block
-              @click="startSync"
-              :loading="syncLoading"
-              :disabled="selectedTables.length === 0"
-            >
-              <sync-outlined /> 同步选中表 ({{ selectedTables.length }} 张)
-            </a-button>
+              <!-- 同步按钮 -->
+              <a-button
+                type="primary"
+                size="large"
+                block
+                @click="startSync"
+                :loading="syncLoading"
+                :disabled="selectedTables.length === 0"
+              >
+                <sync-outlined /> 同步选中表 ({{ selectedTables.length }} 张)
+              </a-button>
+            </template>
 
             <!-- 同步结果 -->
             <a-alert
@@ -306,7 +376,21 @@ import { ref, computed, onMounted, watch } from 'vue';
 import { message } from 'ant-design-vue';
 import { SyncOutlined, EyeOutlined, SettingOutlined, LoadingOutlined } from '@ant-design/icons-vue';
 import { dorisApi } from '../api/doris';
+import { extractApiErrorMessage } from '../api/errors';
 import dayjs, { Dayjs } from 'dayjs';
+
+const props = withDefaults(defineProps<{
+  localTableCount?: number;
+}>(), {
+  localTableCount: 0,
+});
+
+const emit = defineEmits<{
+  (event: 'view-registry'): void;
+  (event: 'registry-count-loaded', count: number): void;
+}>();
+
+const localSyncedTableCount = computed(() => props.localTableCount || 0);
 
 // 表单状态
 const formState = ref({
@@ -323,6 +407,7 @@ const databases = ref<string[]>([]);
 const datasources = ref<any[]>([]);
 const selectedDatasource = ref<any>(null);
 const remoteTables = ref<any[]>([]);
+const remoteTablesError = ref('');
 const selectedTables = ref<string[]>([]);
 const syncTasks = ref<any[]>([]);
 const syncedTableNames = ref<Set<string>>(new Set());
@@ -422,6 +507,48 @@ const syncResultDescription = computed(() => {
   return `未知错误 (原始数据: ${JSON.stringify(syncResult.value).substring(0, 200)}...)`;
 });
 
+const registryEntryButtonText = computed(() => `进入已同步表格 (${localSyncedTableCount.value})`);
+
+const extractDatasourcePayloadError = (payload: any): string => {
+  if (!payload) return '未知错误';
+  const detail = payload.detail;
+  if (typeof detail === 'string') return detail;
+  if (detail && typeof detail === 'object') {
+    return detail.error || detail.message || JSON.stringify(detail);
+  }
+  return payload.error || payload.message || '未知错误';
+};
+
+const loadRegistryState = async () => {
+  const registryRes = await dorisApi.tableRegistry.list();
+  const registryTables = registryRes.data.tables || [];
+  emit('registry-count-loaded', registryTables.length);
+  const synced = registryTables
+    .filter((t: any) => t?.source_type === 'database_sync' && t?.table_name)
+    .map((t: any) => t.table_name);
+  syncedTableNames.value = new Set(synced);
+};
+
+const loadSyncTasks = async () => {
+  const tasksRes = await dorisApi.syncTasks.list();
+  syncTasks.value = tasksRes.data.tasks || [];
+};
+
+const loadRemoteTables = async (datasourceId: string) => {
+  remoteTablesError.value = '';
+  remoteTables.value = [];
+  const tablesRes = await dorisApi.datasource.getTables(datasourceId);
+  if (tablesRes.data?.success === false) {
+    remoteTablesError.value = extractDatasourcePayloadError(tablesRes.data);
+    return;
+  }
+  remoteTables.value = tablesRes.data.tables || [];
+};
+
+const goToRegistry = () => {
+  emit('view-registry');
+};
+
 // 测试连接
 const testConnection = async () => {
   if (!formState.value.host || !formState.value.user) {
@@ -491,26 +618,32 @@ const selectDataSource = async (ds: any) => {
   selectedDatasource.value = ds;
   selectedTables.value = [];
   syncResult.value = null;
+  remoteTablesError.value = '';
 
   tablesLoading.value = true;
-  try {
-    const [tablesRes, tasksRes, registryRes] = await Promise.all([
-      dorisApi.datasource.getTables(ds.id),
-      dorisApi.syncTasks.list(),
-      dorisApi.tableRegistry.list(),
-    ]);
-    remoteTables.value = tablesRes.data.tables || [];
-    syncTasks.value = tasksRes.data.tasks || [];
-    const registryTables = registryRes.data.tables || [];
-    const synced = registryTables
-      .filter((t: any) => t?.source_type === 'database_sync' && t?.table_name)
-      .map((t: any) => t.table_name);
-    syncedTableNames.value = new Set(synced);
-  } catch (error: any) {
-    message.error('获取表列表失败: ' + (error.response?.data?.detail || error.message));
-  } finally {
-    tablesLoading.value = false;
+
+  const [remoteResult, tasksResult, registryResult] = await Promise.allSettled([
+    loadRemoteTables(ds.id),
+    loadSyncTasks(),
+    loadRegistryState(),
+  ]);
+
+  if (remoteResult.status === 'rejected') {
+    remoteTablesError.value = extractApiErrorMessage(remoteResult.reason);
   }
+  if (tasksResult.status === 'rejected') {
+    message.error('加载同步任务失败: ' + extractApiErrorMessage(tasksResult.reason));
+  }
+  if (registryResult.status === 'rejected') {
+    message.error('加载已同步表失败: ' + extractApiErrorMessage(registryResult.reason));
+  }
+
+  if (remoteTablesError.value && localSyncedTableCount.value > 0) {
+    message.warning('源库当前不可用，已切换到可用的“已同步表格”页签。');
+    goToRegistry();
+  }
+
+  tablesLoading.value = false;
 };
 
 // 删除数据源
@@ -521,6 +654,7 @@ const deleteDataSource = async (dsId: string) => {
     if (selectedDatasource.value?.id === dsId) {
       selectedDatasource.value = null;
       remoteTables.value = [];
+      remoteTablesError.value = '';
     }
     loadDatasources();
   } catch (error: any) {
@@ -716,6 +850,7 @@ const startSync = async () => {
     syncTasks.value = tasksRes.data.tasks || [];
     const registryRes = await dorisApi.tableRegistry.list();
     const registryTables = registryRes.data.tables || [];
+    emit('registry-count-loaded', registryTables.length);
     const synced = registryTables
       .filter((t: any) => t?.source_type === 'database_sync' && t?.table_name)
       .map((t: any) => t.table_name);
@@ -736,5 +871,14 @@ onMounted(() => {
 <style scoped>
 .datasource-sync {
   padding: 24px;
+}
+
+.autofill-trap {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
 }
 </style>
